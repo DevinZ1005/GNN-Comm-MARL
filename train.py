@@ -41,6 +41,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=None, help="Top-K communication sparsification budget.")
     parser.add_argument("--topk-mode", type=str, choices=["attention", "random"], default="attention", help="Top-K neighbor selection strategy.")
     parser.add_argument("--top-k-anneal-steps", type=int, default=None, help="Number of training iterations to anneal top_k from dense to target.")
+    parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility")
     return parser.parse_args()
 
 
@@ -112,6 +113,7 @@ def main() -> None:
     # 3. Configure Multi-Agent Proximal Policy Optimization (PPO)
     config = (
         PPOConfig()
+        .debugging(seed=args.seed)
         .environment(
             env="MultiRobotPhysicsEnv-v0",
             env_config={
