@@ -73,7 +73,10 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             "node_features": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_robots, self.raw_obs_dim), dtype=np.float32),
             "adj_matrix": spaces.Box(low=0.0, high=1.0, shape=(self.num_robots, self.num_robots), dtype=np.float32),
             "edge_features": spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_robots, self.num_robots, self.edge_dim), dtype=np.float32),
-            "node_index": spaces.Box(low=0, high=self.num_robots - 1, shape=(1,), dtype=np.int64)
+            "node_index": spaces.Box(low=0, high=self.num_robots - 1, shape=(1,), dtype=np.int64),
+            # Pre-drawn random scores for topk_mode='random' comm sparsification.
+            # Generated once per env step so PPO's multi-epoch SGD replays the same mask.
+            "random_comm_mask": spaces.Box(low=0.0, high=1.0, shape=(self.num_robots, self.num_robots), dtype=np.float32)
         })
         single_agent_action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.action_dim,), dtype=np.float32)
 
@@ -161,13 +164,18 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         info_dict = {}
         all_node_features = self._extract_all_node_features()
 
+        # Draw a single random comm mask for this env step — shared across all agents
+        # so every agent's obs snapshot references the same random topology.
+        random_comm_mask = np.random.rand(self.num_robots, self.num_robots).astype(np.float32)
+
         for idx, agent_id in enumerate(self._agent_ids):
             obs_dict[agent_id] = {
                 "local_obs": all_node_features[idx].copy(),
                 "node_features": all_node_features.copy(),
                 "adj_matrix": self.adj_matrix.copy(),
                 "edge_features": self.edge_features.copy(),
-                "node_index": np.array([idx], dtype=np.int64)
+                "node_index": np.array([idx], dtype=np.int64),
+                "random_comm_mask": random_comm_mask.copy()
             }
             info_dict[agent_id] = {"graph_connectivity": float(np.sum(self.adj_matrix[idx]))}
 
@@ -230,13 +238,17 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         if curr_payload_dist < 1.0:
             terminated_dict["__all__"] = True
 
+        # Draw a single random comm mask for this env step — shared across all agents
+        random_comm_mask = np.random.rand(self.num_robots, self.num_robots).astype(np.float32)
+
         for idx, agent_id in enumerate(self._agent_ids):
             obs_dict[agent_id] = {
                 "local_obs": all_node_features[idx].copy(),
                 "node_features": all_node_features.copy(),
                 "adj_matrix": self.adj_matrix.copy(),
                 "edge_features": self.edge_features.copy(),
-                "node_index": np.array([idx], dtype=np.int64)
+                "node_index": np.array([idx], dtype=np.int64),
+                "random_comm_mask": random_comm_mask.copy()
             }
 
             # Individual reward shaping per robot

@@ -100,7 +100,8 @@ class EdgeConditionedGATLayer(nn.Module):
         self,
         node_features: torch.Tensor,
         adj_matrix: torch.Tensor,
-        edge_features: torch.Tensor
+        edge_features: torch.Tensor,
+        random_comm_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Forward pass for dynamic topological message passing.
@@ -112,6 +113,11 @@ class EdgeConditionedGATLayer(nn.Module):
             edge_features: Tensor of shape (batch_size, num_nodes, num_nodes, edge_dim).
                            edge_features[b, i, j] contains the geometry of node j as seen
                            from node i (displacement from i to j).
+            random_comm_mask: Optional tensor of shape (batch_size, num_nodes, num_nodes)
+                              containing pre-drawn uniform random scores for topk_mode='random'.
+                              Generated once per env step in env_core.py so PPO's multi-epoch
+                              SGD replays the same neighbor selection. Required when
+                              topk_mode='random'; ignored otherwise.
 
         Returns:
             Updated node features of shape (batch_size, num_nodes, node_dim).
@@ -185,35 +191,16 @@ class EdgeConditionedGATLayer(nn.Module):
                     # neighbors to keep has zero gradient — effectively a hard gate.
                     _, topk_indices = torch.topk(selection_scores, k=effective_k, dim=2)
                 elif self.topk_mode == 'random':
-                    # Random baseline: assign uniform random scores to in-range neighbors.
-                    # Shares the same adjacency constraint as 'attention' mode; only the
-                    # selection criterion differs.
-                    #
-                    # IMPORTANT: The random mask must be deterministic for a given input
-                    # so that PPO's multiple SGD epochs over the same batch see a
-                    # consistent topology (matching attention mode's behavior).
-                    # We derive a seed from the input content so identical
-                    # (node_features, adj_matrix, edge_features) always produce the
-                    # same neighbor selection.
-                    seed = int(torch.randint(
-                        0, 2**31,
-                        size=(1,),
-                        generator=torch.Generator(device='cpu').manual_seed(
-                            hash((
-                                node_features.detach().to('cpu', non_blocking=False).numpy().data.tobytes(),
-                                adj_matrix.detach().to('cpu', non_blocking=False).numpy().data.tobytes(),
-                            ))
+                    # Random baseline: use pre-computed random scores from env_core.py.
+                    # These are drawn once per env step and replayed across all PPO SGD
+                    # epochs, matching the attention branch's per-state consistency.
+                    if random_comm_mask is None:
+                        raise ValueError(
+                            "topk_mode='random' requires random_comm_mask to be provided. "
+                            "This tensor should be generated once per env step (in "
+                            "env_core.py) and passed through the observation dict."
                         )
-                    ).item())
-                    rng = torch.Generator(device=adj_matrix.device if adj_matrix.device.type != 'mps' else 'cpu')
-                    rng.manual_seed(seed)
-                    random_scores = torch.rand(
-                        batch_size, num_nodes, num_nodes,
-                        generator=rng,
-                        device=adj_matrix.device if adj_matrix.device.type != 'mps' else 'cpu'
-                    )
-                    if random_scores.device != adj_matrix.device:
-                        random_scores = random_scores.to(adj_matrix.device)
+                    random_scores = random_comm_mask.clone()
                     random_scores.masked_fill_(adj_matrix == 0, -float('inf'))
                     random_scores.masked_fill_(diag_mask, -float('inf'))
                     _, topk_indices = torch.topk(random_scores, k=effective_k, dim=2)
@@ -359,7 +346,8 @@ class DynamicTopologicalGNN(nn.Module):
         self,
         raw_obs: torch.Tensor,
         adj_matrix: torch.Tensor,
-        edge_features: torch.Tensor
+        edge_features: torch.Tensor,
+        random_comm_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Execute multi-hop topological message passing.
@@ -368,6 +356,9 @@ class DynamicTopologicalGNN(nn.Module):
             raw_obs: Local observations tensor of shape (batch_size, num_nodes, raw_obs_dim).
             adj_matrix: Adjacency matrix tensor of shape (batch_size, num_nodes, num_nodes).
             edge_features: Edge geometry tensor of shape (batch_size, num_nodes, num_nodes, edge_dim).
+            random_comm_mask: Optional pre-drawn random scores for topk_mode='random'.
+                              Shape (batch_size, num_nodes, num_nodes). See
+                              EdgeConditionedGATLayer.forward() for details.
 
         Returns:
             Latent communication vectors of shape (batch_size, num_nodes, comm_latent_dim).
@@ -377,7 +368,7 @@ class DynamicTopologicalGNN(nn.Module):
 
         # Propagate messages across dynamic topology across num_layers hops
         for layer in self.gat_layers:
-            h = layer(h, adj_matrix, edge_features)
+            h = layer(h, adj_matrix, edge_features, random_comm_mask=random_comm_mask)
 
         # Project to compact communication latent space
         comm_vectors = self.comm_head(h)
@@ -459,7 +450,8 @@ if __name__ == "__main__":
         topk_mode='random'
     )
 
-    out_random = gnn_random(dummy_obs, dummy_adj, dummy_edges)
+    dummy_random_mask = torch.rand(batch_size, num_robots, num_robots)
+    out_random = gnn_random(dummy_obs, dummy_adj, dummy_edges, random_comm_mask=dummy_random_mask)
     assert out_random.shape == (batch_size, num_robots, latent_dim), \
         f"Expected shape {(batch_size, num_robots, latent_dim)}, got {out_random.shape}"
 

@@ -144,6 +144,7 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         node_features = obs_dict["node_features"].float()
         adj_matrix = obs_dict["adj_matrix"].float()
         edge_features = obs_dict["edge_features"].float()
+        random_comm_mask = obs_dict["random_comm_mask"].float()
         
         # node_index indicates which node in the graph corresponds to the evaluating agent
         node_index = obs_dict["node_index"].long()
@@ -154,7 +155,10 @@ class GNNMARLModel(TorchModelV2, nn.Module):
 
         # 1. Execute topological message passing across the entire dynamic neighborhood graph
         # Shape of gnn_latents: (batch_size, num_nodes, comm_latent_dim)
-        gnn_latents = self.gnn_layer(node_features, adj_matrix, edge_features)
+        gnn_latents = self.gnn_layer(
+            node_features, adj_matrix, edge_features,
+            random_comm_mask=random_comm_mask
+        )
 
         # Average last_drop_frac across all GAT layers
         if hasattr(self.gnn_layer, "gat_layers") and len(self.gnn_layer.gat_layers) > 0:
@@ -227,7 +231,8 @@ if __name__ == "__main__":
         "node_features": torch.randn(batch_size, num_robots, obs_dim),
         "adj_matrix": torch.randint(0, 2, (batch_size, num_robots, num_robots)).float(),
         "edge_features": torch.randn(batch_size, num_robots, num_robots, edge_dim),
-        "node_index": torch.randint(0, num_robots, (batch_size,))
+        "node_index": torch.randint(0, num_robots, (batch_size,)),
+        "random_comm_mask": torch.rand(batch_size, num_robots, num_robots)
     }
     mock_input_dict = {"obs": mock_obs}
     
