@@ -48,7 +48,8 @@ class EdgeConditionedGATLayer(nn.Module):
         Args:
             node_dim: Dimension of input node feature vectors.
             edge_dim: Dimension of edge feature vectors (relative geometry/kinematics).
-            hidden_dim: Hidden dimension per attention head. Total output dim is hidden_dim * num_heads.
+            hidden_dim: Total hidden dimension across all attention heads (split evenly:
+                head_dim = hidden_dim // num_heads per head).
             num_heads: Number of parallel attention heads for multi-head attention.
             dropout: Dropout probability applied to attention weights and message transformations.
             leaky_relu_slope: Negative slope parameter for LeakyReLU activation in attention calculation.
@@ -109,7 +110,8 @@ class EdgeConditionedGATLayer(nn.Module):
             adj_matrix: Binary adjacency tensor of shape (batch_size, num_nodes, num_nodes).
                         adj_matrix[b, i, j] == 1 if node j can transmit to node i.
             edge_features: Tensor of shape (batch_size, num_nodes, num_nodes, edge_dim).
-                           edge_features[b, i, j] contains geometry from node j to node i.
+                           edge_features[b, i, j] contains the geometry of node j as seen
+                           from node i (displacement from i to j).
 
         Returns:
             Updated node features of shape (batch_size, num_nodes, node_dim).
@@ -186,9 +188,32 @@ class EdgeConditionedGATLayer(nn.Module):
                     # Random baseline: assign uniform random scores to in-range neighbors.
                     # Shares the same adjacency constraint as 'attention' mode; only the
                     # selection criterion differs.
+                    #
+                    # IMPORTANT: The random mask must be deterministic for a given input
+                    # so that PPO's multiple SGD epochs over the same batch see a
+                    # consistent topology (matching attention mode's behavior).
+                    # We derive a seed from the input content so identical
+                    # (node_features, adj_matrix, edge_features) always produce the
+                    # same neighbor selection.
+                    seed = int(torch.randint(
+                        0, 2**31,
+                        size=(1,),
+                        generator=torch.Generator(device='cpu').manual_seed(
+                            hash((
+                                node_features.detach().to('cpu', non_blocking=False).numpy().data.tobytes(),
+                                adj_matrix.detach().to('cpu', non_blocking=False).numpy().data.tobytes(),
+                            ))
+                        )
+                    ).item())
+                    rng = torch.Generator(device=adj_matrix.device if adj_matrix.device.type != 'mps' else 'cpu')
+                    rng.manual_seed(seed)
                     random_scores = torch.rand(
-                        batch_size, num_nodes, num_nodes, device=adj_matrix.device
+                        batch_size, num_nodes, num_nodes,
+                        generator=rng,
+                        device=adj_matrix.device if adj_matrix.device.type != 'mps' else 'cpu'
                     )
+                    if random_scores.device != adj_matrix.device:
+                        random_scores = random_scores.to(adj_matrix.device)
                     random_scores.masked_fill_(adj_matrix == 0, -float('inf'))
                     random_scores.masked_fill_(diag_mask, -float('inf'))
                     _, topk_indices = torch.topk(random_scores, k=effective_k, dim=2)
