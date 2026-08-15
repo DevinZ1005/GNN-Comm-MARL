@@ -273,20 +273,52 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         return obs_dict, reward_dict, terminated_dict, truncated_dict, info_dict
 
     def _apply_robot_action(self, robot_idx: int, action: np.ndarray) -> None:
-        """Applies differential drive velocity/force commands to PyBullet robot body."""
+        """Applies differential drive force/torque commands to PyBullet robot body."""
         if PYBULLET_AVAILABLE and self.physics_client is not None and len(self.robot_body_ids) > robot_idx:
             body_id = self.robot_body_ids[robot_idx]
-            # Apply force proportional to wheel commands
-            force = [float(action[0] * 20.0), float(action[1] * 20.0), 0.0]
-            p.applyExternalForce(body_id, -1, forceObj=force, posObj=[0, 0, 0], flags=p.LINK_FRAME, physicsClientId=self.physics_client)
+
+            left_wheel_vel = float(action[0])
+            right_wheel_vel = float(action[1])
+
+            # Forward thrust: sum of wheel velocities drives translation along local X
+            forward_gain = 20.0
+            forward_force_mag = forward_gain * (left_wheel_vel + right_wheel_vel)
+            force = [forward_force_mag, 0.0, 0.0]
+
+            # Yaw torque: difference of wheel velocities drives rotation about Z
+            torque_gain = 8.0  # tune separately from forward_gain
+            yaw_torque_mag = torque_gain * (left_wheel_vel - right_wheel_vel)
+            torque = [0.0, 0.0, yaw_torque_mag]
+
+            p.applyExternalForce(
+                body_id, -1, forceObj=force, posObj=[0, 0, 0],
+                flags=p.LINK_FRAME, physicsClientId=self.physics_client
+            )
+            p.applyExternalTorque(
+                body_id, -1, torqueObj=torque,
+                flags=p.LINK_FRAME, physicsClientId=self.physics_client
+            )
 
     def _step_kinematics_fallback(self, action_dict: Dict[str, Any]) -> None:
         """Kinematic simulation fallback when headless without PyBullet C++ binaries."""
         for idx, agent_id in enumerate(self._agent_ids):
-            if agent_id in action_dict:
-                act = action_dict[agent_id]
-                self.robot_velocities[idx] = [float(act[0] * 1.5), float(act[1] * 1.5), 0.0]
-                self.robot_positions[idx] += self.robot_velocities[idx] * (self.dt * self.physics_steps_per_env_step)
+            act = action_dict.get(agent_id, np.zeros(self.action_dim))
+            left_wheel_vel = float(act[0])
+            right_wheel_vel = float(act[1])
+
+            forward_speed = 1.5 * (left_wheel_vel + right_wheel_vel) / 2.0
+            yaw_rate = 1.5 * (left_wheel_vel - right_wheel_vel)
+
+            # Track heading per-robot for the kinematic model
+            if not hasattr(self, "robot_headings"):
+                self.robot_headings = np.zeros(self.num_robots, dtype=np.float32)
+            self.robot_headings[idx] += yaw_rate * (self.dt * self.physics_steps_per_env_step)
+
+            heading = self.robot_headings[idx]
+            vx = forward_speed * np.cos(heading)
+            vy = forward_speed * np.sin(heading)
+            self.robot_velocities[idx] = [vx, vy, 0.0]
+            self.robot_positions[idx] += self.robot_velocities[idx] * (self.dt * self.physics_steps_per_env_step)
 
     def _update_kinematics_and_graph(self) -> None:
         """Updates robot states and constructs the dynamic adjacency matrix and edge tensors."""

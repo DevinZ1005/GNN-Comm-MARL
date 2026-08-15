@@ -101,8 +101,9 @@ class EdgeConditionedGATLayer(nn.Module):
         node_features: torch.Tensor,
         adj_matrix: torch.Tensor,
         edge_features: torch.Tensor,
-        random_comm_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        random_comm_mask: Optional[torch.Tensor] = None,
+        shared_topk_indices: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass for dynamic topological message passing.
 
@@ -118,9 +119,22 @@ class EdgeConditionedGATLayer(nn.Module):
                               Generated once per env step in env_core.py so PPO's multi-epoch
                               SGD replays the same neighbor selection. Required when
                               topk_mode='random'; ignored otherwise.
+            shared_topk_indices: Optional tensor of shape (batch_size, num_nodes, effective_k)
+                              from a previous layer's neighbor selection in this same forward
+                              pass. When provided, this layer skips computing its own top-K
+                              selection (attention or random) and reuses these indices instead,
+                              so the *set* of neighbors is fixed for the whole multi-layer stack
+                              while each layer still computes its own attention weights and
+                              messages over that fixed set. Keeps 'attention' mode symmetric
+                              with 'random' mode, whose mask is already identical across layers
+                              since it's a deterministic function of the same random_comm_mask
+                              and adjacency at every layer.
 
         Returns:
-            Updated node features of shape (batch_size, num_nodes, node_dim).
+            Tuple of (updated node features of shape (batch_size, num_nodes, node_dim),
+            the top-K neighbor indices used this layer, or None if top_k sparsification
+            is disabled). The caller (DynamicTopologicalGNN) caches the first layer's
+            indices and passes them back in as shared_topk_indices for later layers.
 
         Note on gradient flow and attention entropy (top_k mode):
             When top_k is enabled, ``torch.topk``'s index selection is a non-differentiable
@@ -182,7 +196,12 @@ class EdgeConditionedGATLayer(nn.Module):
                     num_nodes, device=adj_matrix.device, dtype=torch.bool
                 ).unsqueeze(0)
 
-                if self.topk_mode == 'attention':
+                if shared_topk_indices is not None:
+                    # Reuse a previous layer's neighbor selection instead of recomputing:
+                    # keeps the chosen neighbor *set* fixed across the whole stack while this
+                    # layer still uses its own attention weights/messages over that set.
+                    topk_indices = shared_topk_indices
+                elif self.topk_mode == 'attention':
                     selection_scores = avg_scores_for_topk.clone()
                     selection_scores.masked_fill_(diag_mask, -float('inf'))
                     # GRADIENT STOP: torch.topk's index selection is a non-differentiable
@@ -233,8 +252,10 @@ class EdgeConditionedGATLayer(nn.Module):
                 masked_scores = masked_scores.masked_fill(topk_mask_expanded == 0, -1e9)
             else:
                 self.last_drop_frac = 0.0
+                topk_indices = None
         else:
             self.last_drop_frac = 0.0
+            topk_indices = None
 
         # Compute normalized attention coefficients across neighbors (dim=2 is sender node j)
         alpha = F.softmax(masked_scores, dim=2)
@@ -266,7 +287,7 @@ class EdgeConditionedGATLayer(nn.Module):
         out_projected = self.dropout(self.proj_out(aggregated))
         updated_features = self.layer_norm(node_features + out_projected)
 
-        return updated_features
+        return updated_features, topk_indices
 
 
 class DynamicTopologicalGNN(nn.Module):
@@ -366,9 +387,23 @@ class DynamicTopologicalGNN(nn.Module):
         # Encode initial node representations
         h = self.node_encoder(raw_obs)
 
-        # Propagate messages across dynamic topology across num_layers hops
+        # Propagate messages across dynamic topology across num_layers hops.
+        # Neighbor selection (topk_indices) is computed once, at the first layer, and
+        # reused unchanged at every subsequent layer — each layer still computes its own
+        # attention weights and messages over that fixed neighbor set. This keeps the
+        # comparison between topk_mode='attention' and topk_mode='random' fair: without
+        # this, 'random' mode's neighbor set is already identical across layers (same
+        # random_comm_mask + adjacency every layer), while 'attention' mode would otherwise
+        # re-select independently at each layer since each has its own learned q/k.
+        shared_topk_indices = None
         for layer in self.gat_layers:
-            h = layer(h, adj_matrix, edge_features, random_comm_mask=random_comm_mask)
+            h, layer_topk_indices = layer(
+                h, adj_matrix, edge_features,
+                random_comm_mask=random_comm_mask,
+                shared_topk_indices=shared_topk_indices
+            )
+            if shared_topk_indices is None:
+                shared_topk_indices = layer_topk_indices
 
         # Project to compact communication latent space
         comm_vectors = self.comm_head(h)
