@@ -39,10 +39,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save model weights.")
     parser.add_argument("--train-batch-size", type=int, default=1000, help="PPO train batch size (total env steps per iteration).")
     parser.add_argument("--top-k", type=int, default=None, help="Top-K communication sparsification budget.")
-    parser.add_argument("--topk-mode", type=str, choices=["attention", "random"], default="attention", help="Top-K neighbor selection strategy.")
+    parser.add_argument("--topk-mode", type=str, choices=["attention", "gumbel", "random"], default="attention", help="Top-K neighbor selection strategy.")
+    parser.add_argument("--gumbel-temperature", type=float, default=1.0, help="Temperature for Gumbel-Softmax relaxation (topk_mode='gumbel'). Lower=harder selection.")
     parser.add_argument("--top-k-anneal-steps", type=int, default=None, help="Number of training iterations to anneal top_k from dense to target.")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility")
     parser.add_argument("--gnn-num-layers", type=int, default=2, help="Number of GAT message-passing layers.")
+    parser.add_argument("--no-comm", action="store_true", help="Disable GNN communication (IPPO baseline). Sets comm_latent_dim to 0 and bypasses the GNN layer.")
     return parser.parse_args()
 
 
@@ -153,7 +155,9 @@ def main() -> None:
                     "gnn_num_heads": 4,
                     "top_k": args.top_k,
                     "topk_mode": args.topk_mode,
+                    "gumbel_temperature": args.gumbel_temperature,
                     "top_k_anneal_steps": args.top_k_anneal_steps,
+                    "no_comm": args.no_comm,
                 }
             }
         )

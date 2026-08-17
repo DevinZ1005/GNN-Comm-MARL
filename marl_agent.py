@@ -72,6 +72,8 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         self.gnn_num_heads = kwargs.get("gnn_num_heads", custom_cfg.get("gnn_num_heads", 4))
         self.top_k = kwargs.get("top_k", custom_cfg.get("top_k", None))
         self.topk_mode = kwargs.get("topk_mode", custom_cfg.get("topk_mode", "attention"))
+        self.gumbel_temperature = kwargs.get("gumbel_temperature", custom_cfg.get("gumbel_temperature", 1.0))
+        self.no_comm = kwargs.get("no_comm", custom_cfg.get("no_comm", False))
 
         # If annealing is configured, start dense — the callback in train.py drives the ramp-down
         top_k_anneal_steps = kwargs.get("top_k_anneal_steps", custom_cfg.get("top_k_anneal_steps", None))
@@ -86,7 +88,8 @@ class GNNMARLModel(TorchModelV2, nn.Module):
             num_layers=self.gnn_num_layers,
             num_heads=self.gnn_num_heads,
             top_k=initial_top_k,
-            topk_mode=self.topk_mode
+            topk_mode=self.topk_mode,
+            gumbel_temperature=self.gumbel_temperature
         )
 
         # 2. Local sensor feature encoder (processing direct exteroceptive/proprioceptive inputs)
@@ -108,9 +111,13 @@ class GNNMARLModel(TorchModelV2, nn.Module):
             nn.Linear(self.local_hidden_dim, num_outputs)
         )
 
-        # 4. Critic Head (Value function V(s) estimator for PPO advantage calculation)
+        # 4. Critic Head (CTDE Value function: sees global state during centralized training)
+        # Input: [h_local || z_comm_i || global_state_pooled]
+        # The actor uses only joint_dim = local + comm; the critic additionally sees
+        # a mean-pooled global state across all node embeddings for CTDE.
+        critic_dim = joint_dim + self.comm_latent_dim
         self.critic_head = nn.Sequential(
-            nn.Linear(joint_dim, self.local_hidden_dim),
+            nn.Linear(critic_dim, self.local_hidden_dim),
             nn.ReLU(),
             nn.Linear(self.local_hidden_dim, 1)
         )
@@ -153,21 +160,31 @@ class GNNMARLModel(TorchModelV2, nn.Module):
 
         batch_size = local_obs.shape[0]
 
-        # 1. Execute topological message passing across the entire dynamic neighborhood graph
-        # Shape of gnn_latents: (batch_size, num_nodes, comm_latent_dim)
-        gnn_latents = self.gnn_layer(
-            node_features, adj_matrix, edge_features,
-            random_comm_mask=random_comm_mask
-        )
-
-        # Average last_drop_frac across all GAT layers
-        if hasattr(self.gnn_layer, "gat_layers") and len(self.gnn_layer.gat_layers) > 0:
-            self._last_drop_frac = float(
-                sum(getattr(layer, "last_drop_frac", 0.0) for layer in self.gnn_layer.gat_layers)
-                / len(self.gnn_layer.gat_layers)
+        if self.no_comm:
+            # IPPO baseline: no GNN communication. Zero out communication vectors.
+            # GNN layer exists but is not called (keeps weights for checkpoint compat).
+            num_nodes = node_features.shape[1]
+            gnn_latents = torch.zeros(
+                batch_size, num_nodes, self.comm_latent_dim,
+                device=local_obs.device, dtype=local_obs.dtype
             )
-        else:
             self._last_drop_frac = 0.0
+        else:
+            # 1. Execute topological message passing across the entire dynamic neighborhood graph
+            # Shape of gnn_latents: (batch_size, num_nodes, comm_latent_dim)
+            gnn_latents = self.gnn_layer(
+                node_features, adj_matrix, edge_features,
+                random_comm_mask=random_comm_mask
+            )
+
+            # Average last_drop_frac across all GAT layers
+            if hasattr(self.gnn_layer, "gat_layers") and len(self.gnn_layer.gat_layers) > 0:
+                self._last_drop_frac = float(
+                    sum(getattr(layer, "last_drop_frac", 0.0) for layer in self.gnn_layer.gat_layers)
+                    / len(self.gnn_layer.gat_layers)
+                )
+            else:
+                self._last_drop_frac = 0.0
 
         # 2. Extract the specific communication latent vector z_comm corresponding to agent i
         # Using batch indexing: for each batch element b, select row node_index[b]
@@ -180,9 +197,15 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         # 4. Concatenate local representation with multi-hop communication embedding
         joint_features = torch.cat([h_local, z_comm_i], dim=-1)  # Shape: (batch_size, joint_dim)
 
-        # 5. Compute action distribution logits and cache critic value prediction
+        # 5. Compute action distribution logits (actor: decentralized, uses local + comm only)
         action_logits = self.actor_head(joint_features)
-        self._cur_value = self.critic_head(joint_features).squeeze(-1)
+
+        # 6. CTDE Critic: additionally sees global state via mean-pooling across all nodes.
+        # This gives the value function access to the full team's latent state during
+        # centralized training, while the actor remains strictly decentralized.
+        global_state = gnn_latents.mean(dim=1)  # (batch_size, comm_latent_dim)
+        critic_input = torch.cat([joint_features, global_state], dim=-1)  # (batch_size, critic_dim)
+        self._cur_value = self.critic_head(critic_input).squeeze(-1)
 
         return action_logits, state
 
