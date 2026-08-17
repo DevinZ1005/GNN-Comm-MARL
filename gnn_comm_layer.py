@@ -233,6 +233,11 @@ class EdgeConditionedGATLayer(nn.Module):
                     # Mask out-of-range neighbors
                     selection_scores.masked_fill_(adj_matrix == 0, -float('inf'))
 
+                    # Detect isolated nodes: rows where ALL scores are -inf
+                    # (no in-range neighbors excluding self). F.gumbel_softmax on an
+                    # all-inf row is 0/0 → NaN, which corrupts the entire batch loss.
+                    has_neighbor = torch.isfinite(selection_scores).any(dim=2)  # (B, N)
+
                     # Produce a soft top-k mask via repeated Gumbel-Softmax sampling
                     # Each iteration samples one neighbor per node, then masks it out
                     soft_topk_mask = torch.zeros(
@@ -241,12 +246,20 @@ class EdgeConditionedGATLayer(nn.Module):
                     remaining_scores = selection_scores.clone()
 
                     for _ in range(effective_k):
-                        # Gumbel-Softmax: differentiable approximation to categorical sampling
-                        # Using straight-through estimator: hard in forward, soft in backward
+                        # Substitute zeros for isolated-node rows to avoid NaN from
+                        # gumbel_softmax(all -inf). Their output is zeroed below.
+                        safe_scores = remaining_scores.clone()
+                        safe_scores[~has_neighbor] = 0.0
+
                         soft_sample = F.gumbel_softmax(
-                            remaining_scores, tau=self.gumbel_temperature,
+                            safe_scores, tau=self.gumbel_temperature,
                             hard=True, dim=2
                         )  # (B, N, N) — one-hot-like per receiver node
+
+                        # Zero out samples from isolated nodes — they have no real
+                        # neighbors to select; self-loop is added unconditionally later.
+                        soft_sample[~has_neighbor] = 0.0
+
                         soft_topk_mask = soft_topk_mask + soft_sample
                         # Mask out the selected neighbor for the next iteration
                         # (prevents selecting the same neighbor twice)
@@ -572,6 +585,45 @@ if __name__ == "__main__":
     for layer in gnn_random.gat_layers:
         print(f"  Layer drop fraction: {layer.last_drop_frac:.4f}")
     print("  Output shape:", out_random.shape, "OK")
+    print("  Gradient flow: OK")
+
+    # --- Test 4: Gumbel-Softmax with isolated nodes (NaN guard) ---
+    print("\n[Test 4] Gumbel-Softmax with isolated nodes (NaN guard)...")
+    gnn_gumbel = DynamicTopologicalGNN(
+        raw_obs_dim=obs_dim,
+        edge_dim=edge_dim,
+        comm_latent_dim=latent_dim,
+        hidden_dim=64,
+        num_layers=2,
+        num_heads=4,
+        top_k=2,
+        topk_mode='gumbel',
+        gumbel_temperature=1.0
+    )
+
+    # Create adjacency where node 0 in batch 0 is completely isolated
+    disconnected_adj = torch.randint(0, 2, (batch_size, num_robots, num_robots)).float()
+    disconnected_adj[0, 0, :] = 0.0  # Node 0 has no outgoing edges
+    disconnected_adj[0, :, 0] = 0.0  # Node 0 has no incoming edges
+
+    out_gumbel = gnn_gumbel(dummy_obs, disconnected_adj, dummy_edges)
+    assert not torch.isnan(out_gumbel).any(), \
+        "NaN detected in Gumbel-Softmax output with isolated nodes!"
+    assert out_gumbel.shape == (batch_size, num_robots, latent_dim), \
+        f"Expected shape {(batch_size, num_robots, latent_dim)}, got {out_gumbel.shape}"
+
+    loss_gumbel = out_gumbel.pow(2).sum()
+    loss_gumbel.backward()
+    assert not any(
+        torch.isnan(p.grad).any() for p in gnn_gumbel.parameters() if p.grad is not None
+    ), "NaN detected in gradients with isolated nodes!"
+    assert gnn_gumbel.node_encoder[0].weight.grad is not None, \
+        "Gradient propagation failed through GNN layers (Gumbel mode)."
+    for layer in gnn_gumbel.gat_layers:
+        print(f"  Layer drop fraction: {layer.last_drop_frac:.4f}")
+    print("  Output shape:", out_gumbel.shape, "OK")
+    print("  No NaN in output: OK")
+    print("  No NaN in gradients: OK")
     print("  Gradient flow: OK")
 
     print("\nAll verification tests passed! DynamicTopologicalGNN functions correctly.")
