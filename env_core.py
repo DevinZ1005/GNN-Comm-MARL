@@ -102,6 +102,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         # State tracking
         self.step_count = 0
         self.prev_payload_dist: float = 0.0
+        self._reward_totals = {"progress": 0.0, "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
         self.robot_positions = np.zeros((self.num_robots, 3), dtype=np.float32)
         self.robot_velocities = np.zeros((self.num_robots, 3), dtype=np.float32)
         self.robot_headings = np.zeros(self.num_robots, dtype=np.float32)
@@ -279,6 +280,10 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             coop_contact = self.contact_bonus if payload_dist_i < self.contact_radius else 0.0
 
             reward_dict[agent_id] = progress_reward + conn_penalty + coop_contact - energy_penalty
+            self._reward_totals["progress"] += progress_reward
+            self._reward_totals["conn"] += conn_penalty
+            self._reward_totals["contact"] += coop_contact
+            self._reward_totals["energy"] -= energy_penalty
             terminated_dict[agent_id] = terminated_dict["__all__"]
             truncated_dict[agent_id] = truncated_dict["__all__"]
             
@@ -293,7 +298,15 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         if terminated_dict["__all__"]:
             for agent_id in self._agent_ids:
                 reward_dict[agent_id] = reward_dict.get(agent_id, 0.0) + self.completion_bonus
+            self._reward_totals["completion"] += self.completion_bonus * self.num_robots
 
+        if terminated_dict["__all__"] or truncated_dict["__all__"]:
+            print(f"[EP END] progress={self._reward_totals['progress']:.2f} "
+                  f"conn={self._reward_totals['conn']:.2f} "
+                  f"contact={self._reward_totals['contact']:.2f} "
+                  f"energy={self._reward_totals['energy']:.2f} "
+                  f"completion={self._reward_totals['completion']:.2f} "
+                  f"final_payload_dist={curr_payload_dist:.2f}")
         return obs_dict, reward_dict, terminated_dict, truncated_dict, info_dict
 
     def _apply_robot_action(self, robot_idx: int, action: np.ndarray) -> None:
