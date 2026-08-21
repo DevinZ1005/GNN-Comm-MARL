@@ -102,7 +102,6 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         # State tracking
         self.step_count = 0
         self.prev_payload_dist: float = 0.0
-        self._reward_totals = {"progress": 0.0, "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
         self.robot_positions = np.zeros((self.num_robots, 3), dtype=np.float32)
         self.robot_velocities = np.zeros((self.num_robots, 3), dtype=np.float32)
         self.robot_headings = np.zeros(self.num_robots, dtype=np.float32)
@@ -137,7 +136,6 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         if seed is not None:
             np.random.seed(seed)
         self.step_count = 0
-        self._reward_totals = {"progress": 0.0, "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
 
         if PYBULLET_AVAILABLE and self.physics_client is not None:
             p.resetSimulation(physicsClientId=self.physics_client)
@@ -170,6 +168,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         # Calculate initial payload-to-goal distance for potential-based progress tracking
         payload_coords = self._get_payload_position()
         self.prev_payload_dist = float(np.linalg.norm(payload_coords - self.goal_pos))
+        self._reward_totals = {"progress": 0.0, "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
 
         # Build agent observations
         obs_dict = {}
