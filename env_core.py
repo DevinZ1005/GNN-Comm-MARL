@@ -137,6 +137,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         if seed is not None:
             np.random.seed(seed)
         self.step_count = 0
+        self._reward_totals = {"progress": 0.0, "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
 
         if PYBULLET_AVAILABLE and self.physics_client is not None:
             p.resetSimulation(physicsClientId=self.physics_client)
