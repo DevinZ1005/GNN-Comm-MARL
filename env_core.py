@@ -20,6 +20,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
+from scipy.linalg import eigh
 
 try:
     import pybullet as p
@@ -51,6 +52,13 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         self.render_mode = self.config.get("render_mode", "headless")
         self.dt = float(self.config.get("dt", 1.0 / 240.0))
         self.physics_steps_per_env_step = int(self.config.get("physics_steps_per_env_step", 10))
+
+        # Contact radius for cooperative bonus and payload fallback dynamics
+        self.contact_radius = float(self.config.get("contact_radius", 1.5))
+        # Terminal completion bonus magnitude (>> typical per-step progress_reward)
+        self.completion_bonus = float(self.config.get("completion_bonus", 100.0))
+        # Cooperative contact bonus per step for robots near the payload
+        self.contact_bonus = float(self.config.get("contact_bonus", 1.0))
 
         # LiDAR ray-casting configuration
         self.lidar_num_rays = 12          # Matches raw_obs_dim slot 6:18
@@ -96,6 +104,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         self.prev_payload_dist: float = 0.0
         self.robot_positions = np.zeros((self.num_robots, 3), dtype=np.float32)
         self.robot_velocities = np.zeros((self.num_robots, 3), dtype=np.float32)
+        self.robot_headings = np.zeros(self.num_robots, dtype=np.float32)
         self.adj_matrix = np.zeros((self.num_robots, self.num_robots), dtype=np.float32)
         self.edge_features = np.zeros((self.num_robots, self.num_robots, self.edge_dim), dtype=np.float32)
 
@@ -150,6 +159,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
                 angle = 2.0 * np.pi * i / self.num_robots
                 self.robot_positions[i] = [2.0 * np.cos(angle), 2.0 * np.sin(angle), 0.1]
                 self.robot_velocities[i] = [0.0, 0.0, 0.0]
+            self.robot_headings.fill(0.0)
             self.payload_pos = np.array([0.0, 0.0, 0.2], dtype=np.float32)
 
         # Update physical state and construct graph topology
@@ -158,6 +168,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         # Calculate initial payload-to-goal distance for potential-based progress tracking
         payload_coords = self._get_payload_position()
         self.prev_payload_dist = float(np.linalg.norm(payload_coords - self.goal_pos))
+        self._reward_totals = {"progress": 0.0, "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
 
         # Build agent observations
         obs_dict = {}
@@ -197,15 +208,15 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         self.step_count += 1
 
         # 1. Apply motor actions across physics substeps
-        for _ in range(self.physics_steps_per_env_step):
-            for idx, agent_id in enumerate(self._agent_ids):
-                if agent_id in action_dict:
-                    action = np.clip(action_dict[agent_id], -1.0, 1.0)
-                    self._apply_robot_action(idx, action)
-            if PYBULLET_AVAILABLE and self.physics_client is not None:
+        if PYBULLET_AVAILABLE and self.physics_client is not None:
+            for _ in range(self.physics_steps_per_env_step):
+                for idx, agent_id in enumerate(self._agent_ids):
+                    if agent_id in action_dict:
+                        action = np.clip(action_dict[agent_id], -1.0, 1.0)
+                        self._apply_robot_action(idx, action)
                 p.stepSimulation(physicsClientId=self.physics_client)
-            else:
-                self._step_kinematics_fallback(action_dict)
+        else:
+            self._step_kinematics_fallback(action_dict)
 
         # 2. Update graph topology and physical kinematics post-step
         self._update_kinematics_and_graph()
@@ -219,11 +230,13 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         self.prev_payload_dist = curr_payload_dist
 
         # Compute algebraic connectivity (Fiedler value lambda_2 of Graph Laplacian L = D - A)
+        # Uses scipy.linalg.eigh for symmetric matrices: guarantees real eigenvalues,
+        # avoids spurious complex components from np.linalg.eigvals.
         degree_matrix = np.diag(np.sum(self.adj_matrix, axis=1))
         laplacian = degree_matrix - self.adj_matrix
-        eigenvalues = np.linalg.eigvals(laplacian)
-        sorted_eigs = np.sort(np.real(eigenvalues))
-        fiedler_val = float(sorted_eigs[1]) if len(sorted_eigs) > 1 else 0.0
+        eigenvalues, _ = eigh(laplacian)
+        eigenvalues = np.clip(eigenvalues, 0.0, None)  # Remove floating-point noise
+        fiedler_val = float(eigenvalues[1]) if len(eigenvalues) > 1 else 0.0
 
         # Construct return dictionaries
         obs_dict = {}
@@ -260,16 +273,40 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             neighbor_count = np.sum(self.adj_matrix[idx])
             conn_penalty = -2.0 if neighbor_count == 0 else (0.5 * fiedler_val)
 
-            reward_dict[agent_id] = progress_reward + conn_penalty - energy_penalty
+            # Cooperative contact bonus: reward robots that are near the payload
+            payload_dist_i = float(np.linalg.norm(
+                self.robot_positions[idx][:2] - payload_coords[:2]
+            ))
+            coop_contact = self.contact_bonus if payload_dist_i < self.contact_radius else 0.0
+
+            reward_dict[agent_id] = progress_reward + conn_penalty + coop_contact - energy_penalty
+            self._reward_totals["progress"] += progress_reward
+            self._reward_totals["conn"] += conn_penalty
+            self._reward_totals["contact"] += coop_contact
+            self._reward_totals["energy"] -= energy_penalty
             terminated_dict[agent_id] = terminated_dict["__all__"]
             truncated_dict[agent_id] = truncated_dict["__all__"]
             
             info_dict[agent_id] = {
                 "payload_dist": curr_payload_dist,
                 "fiedler_val": fiedler_val,
-                "neighbor_count": int(neighbor_count)
+                "neighbor_count": int(neighbor_count),
+                "contact": payload_dist_i < self.contact_radius
             }
 
+        # Terminal completion reward: sparse bonus for all agents on task success
+        if terminated_dict["__all__"]:
+            for agent_id in self._agent_ids:
+                reward_dict[agent_id] = reward_dict.get(agent_id, 0.0) + self.completion_bonus
+            self._reward_totals["completion"] += self.completion_bonus * self.num_robots
+
+        if terminated_dict["__all__"] or truncated_dict["__all__"]:
+            print(f"[EP END] progress={self._reward_totals['progress']:.2f} "
+                  f"conn={self._reward_totals['conn']:.2f} "
+                  f"contact={self._reward_totals['contact']:.2f} "
+                  f"energy={self._reward_totals['energy']:.2f} "
+                  f"completion={self._reward_totals['completion']:.2f} "
+                  f"final_payload_dist={curr_payload_dist:.2f}")
         return obs_dict, reward_dict, terminated_dict, truncated_dict, info_dict
 
     def _apply_robot_action(self, robot_idx: int, action: np.ndarray) -> None:
@@ -300,7 +337,14 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             )
 
     def _step_kinematics_fallback(self, action_dict: Dict[str, Any]) -> None:
-        """Kinematic simulation fallback when headless without PyBullet C++ binaries."""
+        """Kinematic simulation fallback when headless without PyBullet C++ binaries.
+
+        Also updates payload position based on forces from robots in contact
+        (within self.contact_radius). Without this, payload_pos was static and
+        progress_reward was always ~0 in fallback mode.
+        """
+        dt_step = self.dt * self.physics_steps_per_env_step
+
         for idx, agent_id in enumerate(self._agent_ids):
             act = action_dict.get(agent_id, np.zeros(self.action_dim))
             left_wheel_vel = float(act[0])
@@ -309,49 +353,61 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             forward_speed = 1.5 * (left_wheel_vel + right_wheel_vel) / 2.0
             yaw_rate = 1.5 * (left_wheel_vel - right_wheel_vel)
 
-            # Track heading per-robot for the kinematic model
-            if not hasattr(self, "robot_headings"):
-                self.robot_headings = np.zeros(self.num_robots, dtype=np.float32)
-            self.robot_headings[idx] += yaw_rate * (self.dt * self.physics_steps_per_env_step)
+            self.robot_headings[idx] += yaw_rate * dt_step
 
             heading = self.robot_headings[idx]
             vx = forward_speed * np.cos(heading)
             vy = forward_speed * np.sin(heading)
             self.robot_velocities[idx] = [vx, vy, 0.0]
-            self.robot_positions[idx] += self.robot_velocities[idx] * (self.dt * self.physics_steps_per_env_step)
+            self.robot_positions[idx] += self.robot_velocities[idx] * dt_step
+
+        # Update payload dynamics: weighted average of velocities from robots
+        # within contact_radius (proximity-weighted linear drag model)
+        weights = []
+        vel_contributions = []
+        for i in range(self.num_robots):
+            dist_to_payload = float(np.linalg.norm(
+                self.robot_positions[i][:2] - self.payload_pos[:2]
+            ))
+            if dist_to_payload < self.contact_radius:
+                w = max(0.0, 1.0 - dist_to_payload / self.contact_radius)
+                weights.append(w)
+                vel_contributions.append(w * self.robot_velocities[i])
+        if weights:
+            total_w = sum(weights)
+            payload_vel = sum(vel_contributions) / total_w
+            self.payload_pos += payload_vel * dt_step
 
     def _update_kinematics_and_graph(self) -> None:
         """Updates robot states and constructs the dynamic adjacency matrix and edge tensors."""
         if PYBULLET_AVAILABLE and self.physics_client is not None and len(self.robot_body_ids) > 0:
             for idx, body_id in enumerate(self.robot_body_ids):
-                pos, _ = p.getBasePositionAndOrientation(body_id, physicsClientId=self.physics_client)
+                pos, orn = p.getBasePositionAndOrientation(body_id, physicsClientId=self.physics_client)
                 vel, _ = p.getBaseVelocity(body_id, physicsClientId=self.physics_client)
                 self.robot_positions[idx] = np.array(pos, dtype=np.float32)
                 self.robot_velocities[idx] = np.array(vel, dtype=np.float32)
+                # Extract yaw from quaternion for ego-centric heading computation
+                _, _, yaw = p.getEulerFromQuaternion(orn)
+                self.robot_headings[idx] = float(yaw)
 
         # Reset graph structures
         self.adj_matrix.fill(0.0)
         self.edge_features.fill(0.0)
 
-        # Compute pairwise Euclidean distances and establish communication edges
-        for i in range(self.num_robots):
-            for j in range(self.num_robots):
-                if i == j:
-                    continue
-                rel_pos = self.robot_positions[j] - self.robot_positions[i]
-                dist = float(np.linalg.norm(rel_pos))
-                
-                # Check Euclidean communication threshold
-                if dist <= self.comm_radius:
-                    self.adj_matrix[i, j] = 1.0
-                    rel_vel = self.robot_velocities[j] - self.robot_velocities[i]
-                    heading_diff = np.arctan2(rel_pos[1], rel_pos[0]) / np.pi
-                    
-                    # Populate edge geometry tensor: [rel_pos(3), rel_vel(3), dist(1), heading_diff(1)]
-                    self.edge_features[i, j, :3] = rel_pos
-                    self.edge_features[i, j, 3:6] = rel_vel
-                    self.edge_features[i, j, 6] = dist
-                    self.edge_features[i, j, 7] = heading_diff
+        # Vectorized pairwise Euclidean distances and dynamic communication edges
+        diff_pos = self.robot_positions[None, :, :] - self.robot_positions[:, None, :]  # [i, j] = pos[j] - pos[i]
+        dists = np.linalg.norm(diff_pos, axis=-1)
+        mask = (dists <= self.comm_radius) & ~np.eye(self.num_robots, dtype=bool)
+        self.adj_matrix = mask.astype(np.float32)
+
+        if mask.any():
+            diff_vel = self.robot_velocities[None, :, :] - self.robot_velocities[:, None, :]
+            raw_angles = np.arctan2(diff_pos[:, :, 1], diff_pos[:, :, 0])
+            heading_diffs = ((raw_angles - self.robot_headings[:, None] + np.pi) % (2 * np.pi) - np.pi) / np.pi
+            self.edge_features[mask, :3] = diff_pos[mask]
+            self.edge_features[mask, 3:6] = diff_vel[mask]
+            self.edge_features[mask, 6] = dists[mask]
+            self.edge_features[mask, 7] = heading_diffs[mask]
 
     def _get_payload_position(self) -> np.ndarray:
         """Retrieves payload world coordinates."""
@@ -420,18 +476,26 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         node_feats = np.zeros((self.num_robots, self.raw_obs_dim), dtype=np.float32)
         payload_pos = self._get_payload_position()
 
+        # Vectorized kinematic features
+        node_feats[:, 0:3] = self.robot_positions
+        node_feats[:, 3:6] = self.robot_velocities
+        node_feats[:, 18:21] = self.goal_pos - self.robot_positions
+        node_feats[:, 21:24] = payload_pos - self.robot_positions
+
+        # Simulated LiDAR ray distances (6:18)
         for i in range(self.num_robots):
-            # Pos (0:3), Vel (3:6)
-            node_feats[i, 0:3] = self.robot_positions[i]
-            node_feats[i, 3:6] = self.robot_velocities[i]
-            # Simulated LiDAR ray distances (6:18)
             node_feats[i, 6:18] = self._cast_lidar_rays(i)
-            # Relative vector to goal (18:21)
-            node_feats[i, 18:21] = self.goal_pos - self.robot_positions[i]
-            # Relative vector to payload (21:24)
-            node_feats[i, 21:24] = payload_pos - self.robot_positions[i]
 
         return node_feats
+
+    def close(self) -> None:
+        """Disconnect PyBullet physics client to prevent resource leaks across worker respawns."""
+        if PYBULLET_AVAILABLE and self.physics_client is not None:
+            try:
+                p.disconnect(physicsClientId=self.physics_client)
+            except Exception:
+                pass  # Already disconnected or invalid client
+            self.physics_client = None
 
 
 if __name__ == "__main__":
