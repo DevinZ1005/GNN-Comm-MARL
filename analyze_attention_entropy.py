@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import os
+import pickle
 import sys
 from typing import Dict, List, Tuple, Optional
 
@@ -54,12 +55,14 @@ def compute_attention_entropy(
         k = first_gat.proj_k(node_features).view(batch_size, num_nodes, first_gat.num_heads, first_gat.head_dim)
         e = first_gat.proj_e(edge_features).view(batch_size, num_nodes, num_nodes, first_gat.num_heads, first_gat.head_dim)
 
-        q_expand = q.unsqueeze(2).expand(-1, -1, num_nodes, -1, -1)
-        k_expand = k.unsqueeze(1).expand(-1, num_nodes, -1, -1, -1)
+        a_q = first_gat.attn_vector[..., :first_gat.head_dim]
+        a_k = first_gat.attn_vector[..., first_gat.head_dim:2 * first_gat.head_dim]
+        a_e = first_gat.attn_vector[..., 2 * first_gat.head_dim:]
 
-        attn_input = torch.cat([q_expand, k_expand, e], dim=-1)
-        raw_scores = (attn_input * first_gat.attn_vector).sum(dim=-1)
-        raw_scores = F.leaky_relu(raw_scores, negative_slope=first_gat.leaky_relu_slope)
+        score_q = (q * a_q).sum(dim=-1).unsqueeze(2)
+        score_k = (k * a_k).sum(dim=-1).unsqueeze(1)
+        score_e = (e * a_e).sum(dim=-1)
+        raw_scores = F.leaky_relu(score_q + score_k + score_e, negative_slope=first_gat.leaky_relu_slope)
 
         # Capture raw scores before any masking
         captured['raw_scores'] = raw_scores.detach().cpu()
@@ -73,7 +76,7 @@ def compute_attention_entropy(
         eye = torch.eye(num_nodes, device=adj_matrix.device, dtype=adj_matrix.dtype).unsqueeze(0)
         adj_with_loops = torch.clamp(adj_matrix + eye, 0.0, 1.0)
         adj_mask = adj_with_loops.unsqueeze(-1)
-        masked_scores = raw_scores.masked_fill(adj_mask == 0, -1e9)
+        masked_scores = raw_scores.masked_fill(adj_mask == 0, getattr(first_gat, '_MASK_VALUE', -1e4))
 
         captured['masked_scores'] = masked_scores.detach().cpu()
 
@@ -108,55 +111,63 @@ def compute_attention_entropy(
 def generate_obs_batches(
     num_robots: int,
     comm_radius: float,
-    num_batches: int,
-    max_steps_per_episode: int = 50
+    num_batches: int = 100,
+    seed: Optional[int] = 42
 ) -> List[Dict[str, torch.Tensor]]:
     """
-    Generate observation batches by running the environment with random actions.
+    Generate observation batches across independent environment episodes.
+    Resets environment for each batch and takes a random number of warmup steps (5-30)
+    under random actions so that each batch samples a distinct, dynamic spatial graph
+    topology across the state space rather than relying on correlated trajectory rollouts.
     """
+    if seed is not None and seed >= 0:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
     env = MultiRobotPhysicsEnv({
         "num_robots": num_robots,
         "comm_radius": comm_radius,
-        "max_steps": max_steps_per_episode
+        "max_steps": 50
     })
 
     batches = []
-    obs, _ = env.reset()
-    steps_in_episode = 0
+    for b in range(num_batches):
+        batch_seed = int((seed * 10007 + b) % (2**31 - 1)) if (seed is not None and seed >= 0) else None
+        obs, _ = env.reset(seed=batch_seed)
 
-    for _ in range(num_batches):
-        # Collect one observation per agent and stack into a batch
+        # Take a randomized number of warmup steps to disperse robots into diverse spatial configurations
+        warmup_steps = int(np.random.randint(5, 30))
+        for _ in range(warmup_steps):
+            actions = {
+                f"robot_{i}": np.random.uniform(-1, 1, size=2).astype(np.float32)
+                for i in range(num_robots)
+            }
+            obs, _, terminated, truncated, _ = env.step(actions)
+            if terminated.get("__all__", False) or truncated.get("__all__", False):
+                obs, _ = env.reset()
+                break
+
+        # Collect one observation per agent and stack into a batch: (num_robots, ...)
         agent_obs_list = []
         for agent_id in sorted(obs.keys()):
-            agent_obs = {k: torch.tensor(v).unsqueeze(0) for k, v in obs[agent_id].items()}
+            agent_obs = {k: torch.as_tensor(v).unsqueeze(0) for k, v in obs[agent_id].items()}
             agent_obs_list.append(agent_obs)
 
-        # Stack into batch: (num_robots, ...)
         batch = {}
         for key in agent_obs_list[0]:
             batch[key] = torch.cat([ao[key] for ao in agent_obs_list], dim=0)
         batches.append(batch)
 
-        # Step with random actions
-        actions = {
-            f"robot_{i}": np.random.uniform(-1, 1, size=2).astype(np.float32)
-            for i in range(num_robots)
-        }
-        obs, _, terminated, truncated, _ = env.step(actions)
-        steps_in_episode += 1
-
-        if terminated.get("__all__", False) or truncated.get("__all__", False) or steps_in_episode >= max_steps_per_episode:
-            obs, _ = env.reset()
-            steps_in_episode = 0
-
     return batches
+
 
 
 def analyze_checkpoint(
     checkpoint_dir: str,
     num_robots: int = 8,
     comm_radius: float = 3.8,
-    num_batches: int = 20
+    num_batches: int = 100,
+    seed: Optional[int] = 42
 ) -> None:
     """
     Load a checkpoint, generate observation batches, and compute attention entropy statistics.
@@ -165,52 +176,75 @@ def analyze_checkpoint(
     print(f"Analyzing checkpoint: {checkpoint_dir}")
     print(f"{'='*70}")
 
-    # Build model with same config used in training
-    obs_dim = 24
-    edge_dim = 8
-    model_config = {
-        "custom_model_config": {
-            "raw_obs_dim": obs_dim,
-            "edge_dim": edge_dim,
-            "comm_latent_dim": 64,
-            "local_hidden_dim": 128,
-            "gnn_num_layers": 2,
-            "gnn_num_heads": 4,
-            "top_k": 2,
-            "topk_mode": "attention"
-        }
+    # Default model config fallbacks
+    custom_model_cfg = {
+        "raw_obs_dim": 24,
+        "edge_dim": 8,
+        "comm_latent_dim": 64,
+        "local_hidden_dim": 128,
+        "gnn_num_layers": 2,
+        "gnn_num_heads": 4,
+        "top_k": 2,
+        "topk_mode": "attention"
     }
 
-    model = GNNMARLModel(
-        obs_space=None,
-        action_space=None,
-        num_outputs=4,  # 2 actions * 2 (mean + log_std)
-        model_config=model_config,
-        name="analysis_model"
-    )
-
-    # Try to load checkpoint weights
+    # Try to load checkpoint weights (RLlib stores policy state in policy_state.pkl)
     policy_dir = os.path.join(checkpoint_dir, "policies", "shared_gnn_policy")
+    policy_state_path = os.path.join(policy_dir, "policy_state.pkl")
     model_weights_path = os.path.join(policy_dir, "model_weights.pth")
 
-    if os.path.exists(model_weights_path):
-        state_dict = torch.load(model_weights_path, map_location="cpu", weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
+    loaded_weights = None
+
+    if os.path.exists(policy_state_path):
+        with open(policy_state_path, "rb") as f:
+            state_data = pickle.load(f)
+        if isinstance(state_data, dict):
+            loaded_weights = state_data.get("weights", None)
+            spec = state_data.get("policy_spec", {})
+            if isinstance(spec, dict):
+                ckpt_cfg = spec.get("config", {}).get("model", {}).get("custom_model_config", {})
+                if ckpt_cfg:
+                    custom_model_cfg.update(ckpt_cfg)
+        print(f"Loaded policy state from {policy_state_path}")
+    elif os.path.exists(model_weights_path):
+        loaded_weights = torch.load(model_weights_path, map_location="cpu", weights_only=True)
         print(f"Loaded model weights from {model_weights_path}")
     else:
         # Try finding weights in alternative locations
         for root, dirs, files in os.walk(checkpoint_dir):
             for f in files:
-                if f.endswith(('.pth', '.pt')):
+                if f.endswith(('.pth', '.pt', '.pkl')):
                     print(f"  Found: {os.path.join(root, f)}")
-        print(f"WARNING: Could not find model_weights.pth at {model_weights_path}")
+        print(f"WARNING: Could not find policy_state.pkl or model_weights.pth at {policy_dir}")
         print("Running analysis with randomly-initialized weights as a baseline comparison.")
+
+    model = GNNMARLModel(
+        obs_space=None,
+        action_space=None,
+        num_outputs=4,  # 2 actions * 2 (mean + log_std)
+        model_config={"custom_model_config": custom_model_cfg},
+        name="analysis_model"
+    )
+
+    if loaded_weights is not None:
+        state_dict = {
+            k: (torch.as_tensor(v) if not isinstance(v, torch.Tensor) else v)
+            for k, v in loaded_weights.items()
+        }
+        # Filter matching keys and shapes to gracefully handle legacy checkpoints or CTDE critic heads
+        model_dict = model.state_dict()
+        filtered_dict = {
+            k: v for k, v in state_dict.items()
+            if k in model_dict and v.shape == model_dict[k].shape
+        }
+        model.load_state_dict(filtered_dict, strict=False)
+        print(f"Successfully loaded {len(filtered_dict)}/{len(state_dict)} parameter tensors into model.")
 
     model.eval()
 
     # Generate observation batches
-    print(f"\nGenerating {num_batches} observation batches with {num_robots} robots...")
-    batches = generate_obs_batches(num_robots, comm_radius, num_batches)
+    print(f"\nGenerating {num_batches} observation batches with {num_robots} robots (seed={seed})...")
+    batches = generate_obs_batches(num_robots, comm_radius, num_batches, seed=seed)
 
     # Collect entropy statistics
     all_pre_mask_entropy = []
@@ -233,16 +267,19 @@ def analyze_checkpoint(
         all_neighbor_counts.append(n_counts)
 
         # Compute entropy ratio: actual / maximum (1.0 = perfectly uniform = collapsed to random)
-        # Average post_mask_entropy across heads for per-node ratio
+        # Average post_mask_entropy across heads for per-node ratio.
+        # Only evaluate on nodes with >1 neighbor (nodes with neighbor_count=1 have max_h=0)
         avg_post = post_mask_h.mean(axis=-1)  # (B, N)
-        ratio = avg_post / (max_h + 1e-12)
-        all_entropy_ratios.append(ratio)
+        valid_nodes = n_counts > 1
+        if valid_nodes.any():
+            ratio = avg_post[valid_nodes] / (max_h[valid_nodes] + 1e-12)
+            all_entropy_ratios.append(ratio)
 
     # Aggregate statistics
     pre_mask_all = np.concatenate(all_pre_mask_entropy, axis=0)   # (total_samples, N, H)
     post_mask_all = np.concatenate(all_post_mask_entropy, axis=0)
     max_h_all = np.concatenate(all_max_entropy, axis=0)
-    ratios_all = np.concatenate(all_entropy_ratios, axis=0)
+    ratios_all = np.concatenate(all_entropy_ratios, axis=0) if all_entropy_ratios else np.array([0.0])
     n_counts_all = np.concatenate(all_neighbor_counts, axis=0)
 
     print(f"\n--- Attention Entropy Statistics ---")
@@ -314,11 +351,15 @@ def main():
                         help="Number of robots (must match checkpoint training config).")
     parser.add_argument("--comm-radius", type=float, default=3.8,
                         help="Communication radius (must match checkpoint training config).")
-    parser.add_argument("--num-batches", type=int, default=20,
-                        help="Number of observation batches to analyze.")
+    parser.add_argument("--num-batches", type=int, default=100,
+                        help="Number of observation batches to analyze (default 100).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for repeatable observation batch sampling (use -1 for unseeded).")
     parser.add_argument("--all-checkpoints", action="store_true",
                         help="Analyze all attn8_k2_s* checkpoints.")
     args = parser.parse_args()
+
+    seed = args.seed if args.seed >= 0 else None
 
     if args.all_checkpoints:
         checkpoint_base = os.path.dirname(args.checkpoint_dir) or "./checkpoints"
@@ -326,9 +367,9 @@ def main():
             if name.startswith("attn8_k2_s") or name.startswith("real_attn_s"):
                 ckpt_path = os.path.join(checkpoint_base, name)
                 if os.path.isdir(ckpt_path):
-                    analyze_checkpoint(ckpt_path, args.num_robots, args.comm_radius, args.num_batches)
+                    analyze_checkpoint(ckpt_path, args.num_robots, args.comm_radius, args.num_batches, seed=seed)
     else:
-        analyze_checkpoint(args.checkpoint_dir, args.num_robots, args.comm_radius, args.num_batches)
+        analyze_checkpoint(args.checkpoint_dir, args.num_robots, args.comm_radius, args.num_batches, seed=seed)
 
 
 if __name__ == "__main__":

@@ -168,19 +168,16 @@ class EdgeConditionedGATLayer(nn.Module):
         k = self.proj_k(node_features).view(batch_size, num_nodes, self.num_heads, self.head_dim)
         e = self.proj_e(edge_features).view(batch_size, num_nodes, num_nodes, self.num_heads, self.head_dim)
 
-        # Expand q and k across pairwise node interactions (batch_size, num_nodes, num_nodes, num_heads, head_dim)
-        # q_expand: receiver node i; k_expand: sender node j
-        q_expand = q.unsqueeze(2).expand(-1, -1, num_nodes, -1, -1)
-        k_expand = k.unsqueeze(1).expand(-1, num_nodes, -1, -1, -1)
+        # Efficient additive attention scoring without materializing 5D concatenated tensors:
+        # attn_vector has shape (1, num_heads, 3 * head_dim) = [a_q || a_k || a_e]
+        a_q = self.attn_vector[..., :self.head_dim]
+        a_k = self.attn_vector[..., self.head_dim:2 * self.head_dim]
+        a_e = self.attn_vector[..., 2 * self.head_dim:]
 
-        # Concatenate receiver (q), sender (k), and edge geometry (e)
-        # Shape: (batch_size, num_nodes, num_nodes, num_heads, 3 * head_dim)
-        attn_input = torch.cat([q_expand, k_expand, e], dim=-1)
-
-        # Calculate raw attention scores via inner product with learnable attention vector
-        # Shape: (batch_size, num_nodes, num_nodes, num_heads)
-        raw_scores = (attn_input * self.attn_vector).sum(dim=-1)
-        raw_scores = F.leaky_relu(raw_scores, negative_slope=self.leaky_relu_slope)
+        score_q = (q * a_q).sum(dim=-1).unsqueeze(2)  # (batch_size, num_nodes, 1, num_heads)
+        score_k = (k * a_k).sum(dim=-1).unsqueeze(1)  # (batch_size, 1, num_nodes, num_heads)
+        score_e = (e * a_e).sum(dim=-1)               # (batch_size, num_nodes, num_nodes, num_heads)
+        raw_scores = F.leaky_relu(score_q + score_k + score_e, negative_slope=self.leaky_relu_slope)
 
         # 2. Mask non-existent edges (where adj_matrix == 0) and self-loops if disconnected
         # Add self-loops to adjacency matrix to ensure every node retains its own features
@@ -195,6 +192,7 @@ class EdgeConditionedGATLayer(nn.Module):
 
         # 2b. Attention-driven top-K communication sparsification
         #     Applied on top of the proximity-based adjacency mask (combined, not replaced).
+        gumbel_gate = None
         if self.top_k is not None and num_nodes > 1:
             effective_k = min(self.top_k, num_nodes - 1)  # Exclude self from K budget
 
@@ -203,9 +201,7 @@ class EdgeConditionedGATLayer(nn.Module):
                 avg_scores_for_topk = masked_scores.mean(dim=-1)  # (batch_size, N, N)
 
                 # Exclude self-loop from top-K competition; self is always retained separately
-                diag_mask = torch.eye(
-                    num_nodes, device=adj_matrix.device, dtype=torch.bool
-                ).unsqueeze(0)
+                diag_mask = eye.bool()
 
                 if shared_topk_indices is not None:
                     # Reuse a previous layer's neighbor selection instead of recomputing:
@@ -215,6 +211,8 @@ class EdgeConditionedGATLayer(nn.Module):
                 elif self.topk_mode == 'attention':
                     selection_scores = avg_scores_for_topk.clone()
                     selection_scores.masked_fill_(diag_mask, -float('inf'))
+                    # Explicitly mask out non-neighbors so only true in-range candidates compete
+                    selection_scores.masked_fill_(adj_matrix == 0, -float('inf'))
                     # GRADIENT STOP: torch.topk's index selection is a non-differentiable
                     # discrete operation (argmax-like). Gradients flow through the selected
                     # attention *values* post-softmax, but the discrete choice of *which* K
@@ -239,31 +237,34 @@ class EdgeConditionedGATLayer(nn.Module):
                     has_neighbor = torch.isfinite(selection_scores).any(dim=2)  # (B, N)
 
                     # Produce a soft top-k mask via repeated Gumbel-Softmax sampling
-                    # Each iteration samples one neighbor per node, then masks it out
                     soft_topk_mask = torch.zeros(
                         batch_size, num_nodes, num_nodes, device=adj_matrix.device
                     )
                     remaining_scores = selection_scores.clone()
 
                     for _ in range(effective_k):
-                        # Substitute zeros for isolated-node rows to avoid NaN from
+                        # Detect nodes with at least one finite remaining candidate
+                        has_candidate = torch.isfinite(remaining_scores).any(dim=2)  # (B, N)
+
+                        # Substitute zeros for rows with no remaining candidates to avoid NaN from
                         # gumbel_softmax(all -inf). Their output is zeroed below.
                         safe_scores = remaining_scores.clone()
-                        safe_scores[~has_neighbor] = 0.0
+                        safe_scores[~has_candidate] = 0.0
 
                         soft_sample = F.gumbel_softmax(
                             safe_scores, tau=self.gumbel_temperature,
                             hard=True, dim=2
                         )  # (B, N, N) — one-hot-like per receiver node
 
-                        # Zero out samples from isolated nodes — they have no real
-                        # neighbors to select; self-loop is added unconditionally later.
-                        soft_sample[~has_neighbor] = 0.0
+                        # Zero out samples from nodes with no remaining candidates
+                        soft_sample[~has_candidate] = 0.0
 
                         soft_topk_mask = soft_topk_mask + soft_sample
-                        # Mask out the selected neighbor for the next iteration
-                        # (prevents selecting the same neighbor twice)
-                        remaining_scores = remaining_scores - soft_sample * 1e6
+                        # Mask out the selected neighbor for the next iteration.
+                        # Uses detached mask to prevent artificial 1e6 gradient explosion across iterations.
+                        remaining_scores = remaining_scores.masked_fill(
+                            soft_sample.detach() > 0.5, -float('inf')
+                        )
 
                     # Clamp to [0, 1] (numerical safety from accumulation)
                     topk_mask = soft_topk_mask.clamp(0.0, 1.0)
@@ -271,7 +272,6 @@ class EdgeConditionedGATLayer(nn.Module):
                     topk_mask.masked_fill_(diag_mask, 1.0)
 
                     # Track drop fraction (same as hard top-k)
-                    # Detach to avoid gradient warning — this is only a monitoring metric
                     in_range_counts = adj_matrix.sum(dim=2)
                     kept_neighbor_mask = topk_mask.detach() * adj_matrix
                     kept_counts = kept_neighbor_mask.sum(dim=2)
@@ -281,12 +281,11 @@ class EdgeConditionedGATLayer(nn.Module):
                     else:
                         self.last_drop_frac = 0.0
 
-                    # Apply soft mask to attention scores
-                    # Unlike hard top-k which uses _MASK_VALUE, the soft mask allows
-                    # partial gradient flow through non-selected neighbors
+                    # Apply discrete mask to attention scores using _MASK_VALUE for softmax,
+                    # and pass soft straight-through gate to attention weights for stable bounded gradient flow
                     topk_mask_expanded = topk_mask.unsqueeze(-1)  # (B, N, N, 1)
-                    masked_scores = masked_scores * topk_mask_expanded + \
-                        self._MASK_VALUE * (1.0 - topk_mask_expanded)
+                    masked_scores = masked_scores.masked_fill(topk_mask_expanded.detach() == 0, self._MASK_VALUE)
+                    gumbel_gate = topk_mask_expanded
 
                     topk_indices = None  # Gumbel mode doesn't produce discrete indices
 
@@ -343,6 +342,8 @@ class EdgeConditionedGATLayer(nn.Module):
 
         # Compute normalized attention coefficients across neighbors (dim=2 is sender node j)
         alpha = F.softmax(masked_scores, dim=2)
+        if gumbel_gate is not None:
+            alpha = alpha * gumbel_gate
         alpha = self.dropout(alpha)  # Shape: (batch_size, num_nodes, num_nodes, num_heads)
 
         # 3. Generate pairwise messages conditioned on receiver, sender, and edge geometry
@@ -354,18 +355,15 @@ class EdgeConditionedGATLayer(nn.Module):
         msg_input = torch.cat([h_i, h_j, edge_features], dim=-1)
         messages = self.msg_mlp(msg_input)  # Shape: (batch_size, num_nodes, num_nodes, hidden_dim)
         
-        # Reshape messages to multi-head format: (batch_size, num_nodes, num_nodes, num_heads, head_dim)
+        # Reshape messages to multi-head format: (batch_size, num_nodes, num_nodes, self.num_heads, self.head_dim)
         messages_mh = messages.view(batch_size, num_nodes, num_nodes, self.num_heads, self.head_dim)
 
-        # 4. Aggregate neighborhood messages using attention weights
-        # alpha shape expanded: (batch_size, num_nodes, num_nodes, num_heads, 1)
-        weighted_messages = messages_mh * alpha.unsqueeze(-1)
-        
+        # 4. Aggregate neighborhood messages using attention weights via efficient einsum
         # Sum across sender nodes j (dim=2): (batch_size, num_nodes, num_heads, head_dim)
-        aggregated_mh = weighted_messages.sum(dim=2)
+        aggregated_mh = torch.einsum('bijh,bijhd->bihd', alpha, messages_mh)
         
         # Flatten head dimension: (batch_size, num_nodes, hidden_dim)
-        aggregated = aggregated_mh.view(batch_size, num_nodes, self.hidden_dim)
+        aggregated = aggregated_mh.reshape(batch_size, num_nodes, self.hidden_dim)
 
         # 5. Output projection + Residual connection + LayerNorm
         out_projected = self.dropout(self.proj_out(aggregated))

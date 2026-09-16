@@ -133,7 +133,8 @@ def main() -> None:
         )
         .env_runners(
             num_env_runners=args.num_workers,
-            num_envs_per_env_runner=1
+            num_envs_per_env_runner=1,
+            rollout_fragment_length="auto"
         )
         .callbacks(CommunicationSparsificationCallback)
         .training(
@@ -173,7 +174,10 @@ def main() -> None:
     )
 
     import torch as _torch
+    _torch.set_num_threads(8)
+    config.extra_python_environs_for_worker = {"OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
     _num_gpus = 1 if _torch.cuda.is_available() else 0
+    config.num_gpus = _num_gpus
     config.sgd_minibatch_size = min(128, args.train_batch_size)
     config.num_epochs = 10
     config.num_gpus_per_learner = _num_gpus

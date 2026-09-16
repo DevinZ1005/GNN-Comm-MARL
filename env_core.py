@@ -208,15 +208,15 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         self.step_count += 1
 
         # 1. Apply motor actions across physics substeps
-        for _ in range(self.physics_steps_per_env_step):
-            for idx, agent_id in enumerate(self._agent_ids):
-                if agent_id in action_dict:
-                    action = np.clip(action_dict[agent_id], -1.0, 1.0)
-                    self._apply_robot_action(idx, action)
-            if PYBULLET_AVAILABLE and self.physics_client is not None:
+        if PYBULLET_AVAILABLE and self.physics_client is not None:
+            for _ in range(self.physics_steps_per_env_step):
+                for idx, agent_id in enumerate(self._agent_ids):
+                    if agent_id in action_dict:
+                        action = np.clip(action_dict[agent_id], -1.0, 1.0)
+                        self._apply_robot_action(idx, action)
                 p.stepSimulation(physicsClientId=self.physics_client)
-            else:
-                self._step_kinematics_fallback(action_dict)
+        else:
+            self._step_kinematics_fallback(action_dict)
 
         # 2. Update graph topology and physical kinematics post-step
         self._update_kinematics_and_graph()
@@ -394,27 +394,20 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         self.adj_matrix.fill(0.0)
         self.edge_features.fill(0.0)
 
-        # Compute pairwise Euclidean distances and establish communication edges
-        for i in range(self.num_robots):
-            for j in range(self.num_robots):
-                if i == j:
-                    continue
-                rel_pos = self.robot_positions[j] - self.robot_positions[i]
-                dist = float(np.linalg.norm(rel_pos))
-                
-                # Check Euclidean communication threshold
-                if dist <= self.comm_radius:
-                    self.adj_matrix[i, j] = 1.0
-                    rel_vel = self.robot_velocities[j] - self.robot_velocities[i]
-                    # Ego-centric heading: subtract observer's own heading, wrap to [-1, 1]
-                    raw_angle = np.arctan2(rel_pos[1], rel_pos[0])
-                    heading_diff = ((raw_angle - self.robot_headings[i] + np.pi) % (2 * np.pi) - np.pi) / np.pi
-                    
-                    # Populate edge geometry tensor: [rel_pos(3), rel_vel(3), dist(1), heading_diff(1)]
-                    self.edge_features[i, j, :3] = rel_pos
-                    self.edge_features[i, j, 3:6] = rel_vel
-                    self.edge_features[i, j, 6] = dist
-                    self.edge_features[i, j, 7] = heading_diff
+        # Vectorized pairwise Euclidean distances and dynamic communication edges
+        diff_pos = self.robot_positions[None, :, :] - self.robot_positions[:, None, :]  # [i, j] = pos[j] - pos[i]
+        dists = np.linalg.norm(diff_pos, axis=-1)
+        mask = (dists <= self.comm_radius) & ~np.eye(self.num_robots, dtype=bool)
+        self.adj_matrix = mask.astype(np.float32)
+
+        if mask.any():
+            diff_vel = self.robot_velocities[None, :, :] - self.robot_velocities[:, None, :]
+            raw_angles = np.arctan2(diff_pos[:, :, 1], diff_pos[:, :, 0])
+            heading_diffs = ((raw_angles - self.robot_headings[:, None] + np.pi) % (2 * np.pi) - np.pi) / np.pi
+            self.edge_features[mask, :3] = diff_pos[mask]
+            self.edge_features[mask, 3:6] = diff_vel[mask]
+            self.edge_features[mask, 6] = dists[mask]
+            self.edge_features[mask, 7] = heading_diffs[mask]
 
     def _get_payload_position(self) -> np.ndarray:
         """Retrieves payload world coordinates."""
@@ -483,16 +476,15 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         node_feats = np.zeros((self.num_robots, self.raw_obs_dim), dtype=np.float32)
         payload_pos = self._get_payload_position()
 
+        # Vectorized kinematic features
+        node_feats[:, 0:3] = self.robot_positions
+        node_feats[:, 3:6] = self.robot_velocities
+        node_feats[:, 18:21] = self.goal_pos - self.robot_positions
+        node_feats[:, 21:24] = payload_pos - self.robot_positions
+
+        # Simulated LiDAR ray distances (6:18)
         for i in range(self.num_robots):
-            # Pos (0:3), Vel (3:6)
-            node_feats[i, 0:3] = self.robot_positions[i]
-            node_feats[i, 3:6] = self.robot_velocities[i]
-            # Simulated LiDAR ray distances (6:18)
             node_feats[i, 6:18] = self._cast_lidar_rays(i)
-            # Relative vector to goal (18:21)
-            node_feats[i, 18:21] = self.goal_pos - self.robot_positions[i]
-            # Relative vector to payload (21:24)
-            node_feats[i, 21:24] = payload_pos - self.robot_positions[i]
 
         return node_feats
 

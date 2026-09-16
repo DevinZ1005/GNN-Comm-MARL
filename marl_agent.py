@@ -188,6 +188,7 @@ class GNNMARLModel(TorchModelV2, nn.Module):
 
         # 2. Extract the specific communication latent vector z_comm corresponding to agent i
         # Using batch indexing: for each batch element b, select row node_index[b]
+        node_index = node_index.to(gnn_latents.device)
         batch_indices = torch.arange(batch_size, device=gnn_latents.device)
         z_comm_i = gnn_latents[batch_indices, node_index, :]  # Shape: (batch_size, comm_latent_dim)
 
