@@ -64,7 +64,7 @@ class GNNMARLModel(TorchModelV2, nn.Module):
 
         # Extract hyperparameters from custom_model_config or kwargs with robust fallbacks
         custom_cfg = model_config.get("custom_model_config", {})
-        self.raw_obs_dim = kwargs.get("raw_obs_dim", custom_cfg.get("raw_obs_dim", 24))
+        self.raw_obs_dim = kwargs.get("raw_obs_dim", custom_cfg.get("raw_obs_dim", 27))
         self.edge_dim = kwargs.get("edge_dim", custom_cfg.get("edge_dim", 8))
         self.comm_latent_dim = kwargs.get("comm_latent_dim", custom_cfg.get("comm_latent_dim", 64))
         self.local_hidden_dim = kwargs.get("local_hidden_dim", custom_cfg.get("local_hidden_dim", 128))
@@ -116,6 +116,10 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         # The actor uses only joint_dim = local + comm; the critic additionally sees
         # a mean-pooled global state across all node embeddings for CTDE.
         critic_dim = joint_dim + self.comm_latent_dim
+        # Identical centralized information in every routing ablation, including no-comm.
+        self.global_encoder = nn.Sequential(
+            nn.Linear(self.raw_obs_dim, self.comm_latent_dim), nn.ReLU()
+        )
         self.critic_head = nn.Sequential(
             nn.Linear(critic_dim, self.local_hidden_dim),
             nn.ReLU(),
@@ -204,7 +208,7 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         # 6. CTDE Critic: additionally sees global state via mean-pooling across all nodes.
         # This gives the value function access to the full team's latent state during
         # centralized training, while the actor remains strictly decentralized.
-        global_state = gnn_latents.mean(dim=1)  # (batch_size, comm_latent_dim)
+        global_state = self.global_encoder(node_features).mean(dim=1)
         critic_input = torch.cat([joint_features, global_state], dim=-1)  # (batch_size, critic_dim)
         self._cur_value = self.critic_head(critic_input).squeeze(-1)
 
@@ -290,4 +294,3 @@ if __name__ == "__main__":
     assert model.gnn_layer.top_k == 2, f"Expected gnn_layer.top_k to be 2, got {model.gnn_layer.top_k}"
     print(f"Logits shape: {logits.shape} | Values shape: {values.shape} | Average Drop Frac: {drop_frac:.4f}")
     print("Verification passed! GNNMARLModel integrates correctly with RLlib TorchModelV2 API and top-K sparsification.")
-

@@ -31,6 +31,8 @@ def parse_log_file(filepath):
     return last_valid
 
 def main():
+    print("HISTORICAL TRAINING LOGS ONLY: not held-out evaluation or valid cross-version evidence.")
+    print("Use compare_evaluations.py for version 2 matched evaluation results.")
     modes = ["dense", "attn", "rand"]
     seeds = [0, 1, 2, 3, 4]
     
@@ -45,6 +47,9 @@ def main():
         for seed in seeds:
             log_path = f"logs/real_{mode}_s{seed}.log"
             data = parse_log_file(log_path) if glob.glob(log_path) else None
+            if data and data["iter"] < 300:
+                print(f"{mode:<12} | {seed:<5} | {data['iter']:<6} | incomplete; excluded from summary")
+                continue
             if data:
                 results[mode].append(data)
                 print(f"{mode:<12} | {seed:<5} | {data['iter']:<6} | {data['reward_mean']:<12.2f} | {data['drop_frac']:<10.4f} | {data['policy_loss']:<12.4f}")

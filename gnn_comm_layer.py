@@ -125,40 +125,18 @@ class EdgeConditionedGATLayer(nn.Module):
             edge_features: Tensor of shape (batch_size, num_nodes, num_nodes, edge_dim).
                            edge_features[b, i, j] contains the geometry of node j as seen
                            from node i (displacement from i to j).
-            random_comm_mask: Optional tensor of shape (batch_size, num_nodes, num_nodes)
-                              containing pre-drawn uniform random scores for topk_mode='random'.
-                              Generated once per env step in env_core.py so PPO's multi-epoch
-                              SGD replays the same neighbor selection. Required when
-                              topk_mode='random'; ignored otherwise.
-            shared_topk_indices: Optional tensor of shape (batch_size, num_nodes, effective_k)
-                              from a previous layer's neighbor selection in this same forward
-                              pass. When provided, this layer skips computing its own top-K
-                              selection (attention or random) and reuses these indices instead,
-                              so the *set* of neighbors is fixed for the whole multi-layer stack
-                              while each layer still computes its own attention weights and
-                              messages over that fixed set. Keeps 'attention' mode symmetric
-                              with 'random' mode, whose mask is already identical across layers
-                              since it's a deterministic function of the same random_comm_mask
-                              and adjacency at every layer.
+            random_comm_mask: Uniform draws stored in the observation, required for
+                random and Gumbel routing so PPO can replay its stochastic input.
+            shared_topk_indices: First-layer integer indices, or the differentiable
+                (B, N, N) gate for Gumbel mode. Reused across the layer stack.
 
         Returns:
-            Tuple of (updated node features of shape (batch_size, num_nodes, node_dim),
-            the top-K neighbor indices used this layer, or None if top_k sparsification
-            is disabled). The caller (DynamicTopologicalGNN) caches the first layer's
-            indices and passes them back in as shared_topk_indices for later layers.
+            Updated features and the shared routing tensor, or None for dense mode.
 
-        Note on gradient flow and attention entropy (top_k mode):
-            When top_k is enabled, ``torch.topk``'s index selection is a non-differentiable
-            discrete operation. Gradients flow through the selected attention *values*
-            (via softmax), but the binary decision of which K neighbors to retain has
-            zero gradient. Early in PPO training — when attention weights are near-uniform
-            across neighbors — this risks attention entropy collapse: a small initial score
-            advantage causes a neighbor to be consistently selected, reinforcing its score
-            while unselected neighbors receive no gradient signal. Since this policy is
-            shared across all agents (``GNNMARLModel`` in marl_agent.py), entropy collapse
-            in one agent's neighborhood can propagate through the shared parameters.
-            Consider using entropy regularization or annealing top_k from ``None`` to the
-            target K over the first ~100K training steps to mitigate this.
+        Hard attention indices have no derivative, but selected attention values
+        and shared score parameters still learn. Gumbel mode supplies a biased
+        straight-through surrogate gradient for routing. Neither method guarantees
+        useful rankings; entropy alone cannot diagnose routing quality.
         """
         batch_size, num_nodes, _ = node_features.shape
 
@@ -188,163 +166,83 @@ class EdgeConditionedGATLayer(nn.Module):
         adj_mask = adj_with_loops.unsqueeze(-1)
         
         # Apply mask: set non-neighbor entries to _MASK_VALUE so Softmax drives attention to ~0
-        masked_scores = raw_scores.masked_fill(adj_mask == 0, self._MASK_VALUE)
+        masked_scores = raw_scores.masked_fill(adj_mask == 0, -float("inf"))
 
-        # 2b. Attention-driven top-K communication sparsification
-        #     Applied on top of the proximity-based adjacency mask (combined, not replaced).
-        gumbel_gate = None
-        if self.top_k is not None and num_nodes > 1:
-            effective_k = min(self.top_k, num_nodes - 1)  # Exclude self from K budget
-
-            if effective_k > 0:
-                # Average attention scores across heads for consistent per-node neighbor selection
-                avg_scores_for_topk = masked_scores.mean(dim=-1)  # (batch_size, N, N)
-
-                # Exclude self-loop from top-K competition; self is always retained separately
-                diag_mask = eye.bool()
-
-                if shared_topk_indices is not None:
-                    # Reuse a previous layer's neighbor selection instead of recomputing:
-                    # keeps the chosen neighbor *set* fixed across the whole stack while this
-                    # layer still uses its own attention weights/messages over that set.
-                    topk_indices = shared_topk_indices
-                elif self.topk_mode == 'attention':
-                    selection_scores = avg_scores_for_topk.clone()
-                    selection_scores.masked_fill_(diag_mask, -float('inf'))
-                    # Explicitly mask out non-neighbors so only true in-range candidates compete
-                    selection_scores.masked_fill_(adj_matrix == 0, -float('inf'))
-                    # GRADIENT STOP: torch.topk's index selection is a non-differentiable
-                    # discrete operation (argmax-like). Gradients flow through the selected
-                    # attention *values* post-softmax, but the discrete choice of *which* K
-                    # neighbors to keep has zero gradient — effectively a hard gate.
-                    _, topk_indices = torch.topk(selection_scores, k=effective_k, dim=2)
-                elif self.topk_mode == 'gumbel':
-                    # Gumbel-Softmax differentiable relaxation: unlike hard torch.topk,
-                    # gradient flows through the neighbor *selection* decision, not just
-                    # the attention weights applied post-selection.
-                    #
-                    # Strategy: Apply Gumbel-Softmax independently per receiver node to
-                    # produce K soft neighbor selections. We sample K times without
-                    # replacement by iteratively masking previously selected neighbors.
-                    selection_scores = avg_scores_for_topk.clone()
-                    selection_scores.masked_fill_(diag_mask, -float('inf'))
-                    # Mask out-of-range neighbors
-                    selection_scores.masked_fill_(adj_matrix == 0, -float('inf'))
-
-                    # Detect isolated nodes: rows where ALL scores are -inf
-                    # (no in-range neighbors excluding self). F.gumbel_softmax on an
-                    # all-inf row is 0/0 → NaN, which corrupts the entire batch loss.
-                    has_neighbor = torch.isfinite(selection_scores).any(dim=2)  # (B, N)
-
-                    # Produce a soft top-k mask via repeated Gumbel-Softmax sampling
-                    soft_topk_mask = torch.zeros(
-                        batch_size, num_nodes, num_nodes, device=adj_matrix.device
-                    )
-                    remaining_scores = selection_scores.clone()
-
-                    for _ in range(effective_k):
-                        # Detect nodes with at least one finite remaining candidate
-                        has_candidate = torch.isfinite(remaining_scores).any(dim=2)  # (B, N)
-
-                        # Substitute zeros for rows with no remaining candidates to avoid NaN from
-                        # gumbel_softmax(all -inf). Their output is zeroed below.
-                        safe_scores = remaining_scores.clone()
-                        safe_scores[~has_candidate] = 0.0
-
-                        soft_sample = F.gumbel_softmax(
-                            safe_scores, tau=self.gumbel_temperature,
-                            hard=True, dim=2
-                        )  # (B, N, N) — one-hot-like per receiver node
-
-                        # Zero out samples from nodes with no remaining candidates
-                        soft_sample[~has_candidate] = 0.0
-
-                        soft_topk_mask = soft_topk_mask + soft_sample
-                        # Mask out the selected neighbor for the next iteration.
-                        # Uses detached mask to prevent artificial 1e6 gradient explosion across iterations.
-                        remaining_scores = remaining_scores.masked_fill(
-                            soft_sample.detach() > 0.5, -float('inf')
-                        )
-
-                    # Clamp to [0, 1] (numerical safety from accumulation)
-                    topk_mask = soft_topk_mask.clamp(0.0, 1.0)
-                    # Self-loops always retained
-                    topk_mask.masked_fill_(diag_mask, 1.0)
-
-                    # Track drop fraction (same as hard top-k)
-                    in_range_counts = adj_matrix.sum(dim=2)
-                    kept_neighbor_mask = topk_mask.detach() * adj_matrix
-                    kept_counts = kept_neighbor_mask.sum(dim=2)
-                    total_in_range = in_range_counts.sum()
-                    if total_in_range > 0:
-                        self.last_drop_frac = float(1.0 - kept_counts.sum() / total_in_range)
-                    else:
-                        self.last_drop_frac = 0.0
-
-                    # Apply discrete mask to attention scores using _MASK_VALUE for softmax,
-                    # and pass soft straight-through gate to attention weights for stable bounded gradient flow
-                    topk_mask_expanded = topk_mask.unsqueeze(-1)  # (B, N, N, 1)
-                    masked_scores = masked_scores.masked_fill(topk_mask_expanded.detach() == 0, self._MASK_VALUE)
-                    gumbel_gate = topk_mask_expanded
-
-                    topk_indices = None  # Gumbel mode doesn't produce discrete indices
-
-                elif self.topk_mode == 'random':
-                    # Random baseline: use pre-computed random scores from env_core.py.
-                    # These are drawn once per env step and replayed across all PPO SGD
-                    # epochs, matching the attention branch's per-state consistency.
-                    if random_comm_mask is None:
-                        raise ValueError(
-                            "topk_mode='random' requires random_comm_mask to be provided. "
-                            "This tensor should be generated once per env step (in "
-                            "env_core.py) and passed through the observation dict."
-                        )
-                    random_scores = random_comm_mask.clone()
-                    random_scores.masked_fill_(adj_matrix == 0, -float('inf'))
-                    random_scores.masked_fill_(diag_mask, -float('inf'))
-                    _, topk_indices = torch.topk(random_scores, k=effective_k, dim=2)
-                else:
-                    raise ValueError(
-                        f"Unknown topk_mode: {self.topk_mode!r}. "
-                        f"Must be 'attention', 'gumbel', or 'random'."
-                    )
-
-                if self.topk_mode not in ('gumbel',):
-                    # Build top-K mask: 1 at selected indices, 0 elsewhere
-                    # (Gumbel mode already built its own soft mask above)
-                    topk_mask = torch.zeros(
-                        batch_size, num_nodes, num_nodes, device=adj_matrix.device
-                    )
-                    topk_mask.scatter_(2, topk_indices, 1.0)
-                    # Always retain self-loops for attention stability (residual also preserves,
-                    # but keeping self in softmax avoids degenerate zero-neighbor distributions)
-                    topk_mask.masked_fill_(diag_mask, 1.0)
-
-                    # Track fraction of in-range neighbors dropped by sparsification
-                    in_range_counts = adj_matrix.sum(dim=2)  # (B, N) — excludes self
-                    kept_neighbor_mask = topk_mask * adj_matrix  # Only count actual in-range retained
-                    kept_counts = kept_neighbor_mask.sum(dim=2)  # (B, N)
-                    total_in_range = in_range_counts.sum()
-                    if total_in_range > 0:
-                        self.last_drop_frac = float(1.0 - kept_counts.sum() / total_in_range)
-                    else:
-                        self.last_drop_frac = 0.0
-
-                    # Apply top-K mask on top of existing adjacency mask (combined, not replaced)
-                    topk_mask_expanded = topk_mask.unsqueeze(-1)  # (B, N, N, 1)
-                    masked_scores = masked_scores.masked_fill(topk_mask_expanded == 0, self._MASK_VALUE)
+        # The observation carries routing randomness so PPO replays the same
+        # stochastic policy input during sampling and all optimization epochs.
+        valid = adj_matrix.bool() & ~eye.bool()
+        scores = raw_scores.mean(dim=-1)
+        gate = adj_with_loops
+        topk_indices = None
+        if self.top_k is not None:
+            if self.top_k < 0:
+                raise ValueError("top_k must be nonnegative or None")
+            effective_k = min(self.top_k, num_nodes - 1)
+            selection = scores
+            if self.topk_mode in ("random", "gumbel"):
+                if random_comm_mask is None:
+                    raise ValueError("random and gumbel routing require observation random_comm_mask")
+                uniform = random_comm_mask.clamp(1e-6, 1 - 1e-6)
+                selection = (uniform if self.topk_mode == "random"
+                             else scores - torch.log(-torch.log(uniform)))
+            elif self.topk_mode == "distance":
+                selection = -edge_features[..., 6]
+            elif self.topk_mode != "attention":
+                raise ValueError(f"Unknown routing mode: {self.topk_mode}")
+            if shared_topk_indices is not None and self.topk_mode == "gumbel":
+                gate = shared_topk_indices
+                topk_indices = gate
             else:
-                self.last_drop_frac = 0.0
-                topk_indices = None
+                selection = selection.masked_fill(~valid, -float("inf"))
+                if shared_topk_indices is not None:
+                    topk_indices = shared_topk_indices
+                else:
+                    topk_indices = selection.topk(effective_k, dim=2).indices
+                hard = torch.zeros_like(scores).scatter(2, topk_indices, 1.0) * valid
+                if self.topk_mode == "gumbel" and effective_k > 0:
+                    if self.gumbel_temperature <= 0:
+                        raise ValueError("gumbel_temperature must be positive")
+                    # Sequential relaxed samples supply a surrogate gradient;
+                    # forward execution retains exactly min(K, degree) edges.
+                    remaining = valid.clone()
+                    soft = torch.zeros_like(scores)
+                    for rank in range(effective_k):
+                        candidate = remaining.any(dim=2, keepdim=True)
+                        logits = selection.masked_fill(~remaining, -float("inf"))
+                        logits = torch.where(candidate, logits, torch.zeros_like(logits))
+                        sample = F.softmax(logits / self.gumbel_temperature, dim=2)
+                        soft = soft + sample * candidate
+                        chosen = topk_indices[:, :, rank:rank + 1]
+                        remaining = remaining.scatter(2, chosen, False)
+                    gate = hard + soft - soft.detach() + eye
+                    topk_indices = gate
+                else:
+                    gate = hard + eye
+        selected = (gate.detach() > 0.5) & valid
+        self.last_selected_mask = selected.detach()
+        self.last_attention_scores = scores.detach()
+        self.last_available_edges = int(valid.sum().item())
+        self.last_selected_edges = int(selected.sum().item())
+        self.last_drop_frac = (1 - self.last_selected_edges / self.last_available_edges
+                               if self.last_available_edges else 0.0)
+        if self.topk_mode == "gumbel" and self.top_k is not None:
+            # Do not mask away candidate weights before the straight-through
+            # gate: that would suppress gradients for unselected messages.
+            weights = torch.exp(masked_scores - masked_scores.amax(dim=2, keepdim=True))
+            weights = weights * gate.unsqueeze(-1)
+            alpha = weights / weights.sum(dim=2, keepdim=True).clamp_min(1e-12)
         else:
-            self.last_drop_frac = 0.0
-            topk_indices = None
-
-        # Compute normalized attention coefficients across neighbors (dim=2 is sender node j)
-        alpha = F.softmax(masked_scores, dim=2)
-        if gumbel_gate is not None:
-            alpha = alpha * gumbel_gate
-        alpha = self.dropout(alpha)  # Shape: (batch_size, num_nodes, num_nodes, num_heads)
+            masked_scores = masked_scores.masked_fill(gate.unsqueeze(-1) < 0.5, -float("inf"))
+            alpha = F.softmax(masked_scores, dim=2)
+        self.last_attention_weights = alpha.detach()
+        # Evaluation-only message intervention: hold routing and normalization fixed.
+        ablation = getattr(self, "message_ablation", None)
+        if ablation is not None:
+            receiver, sender = ablation
+            keep = torch.ones_like(alpha)
+            keep[:, receiver, sender, :] = 0
+            alpha = alpha * keep
+        alpha = self.dropout(alpha)
 
         # 3. Generate pairwise messages conditioned on receiver, sender, and edge geometry
         # Expand node features for pairwise concatenation
@@ -604,7 +502,7 @@ if __name__ == "__main__":
     disconnected_adj[0, 0, :] = 0.0  # Node 0 has no outgoing edges
     disconnected_adj[0, :, 0] = 0.0  # Node 0 has no incoming edges
 
-    out_gumbel = gnn_gumbel(dummy_obs, disconnected_adj, dummy_edges)
+    out_gumbel = gnn_gumbel(dummy_obs, disconnected_adj, dummy_edges, random_comm_mask=dummy_random_mask)
     assert not torch.isnan(out_gumbel).any(), \
         "NaN detected in Gumbel-Softmax output with isolated nodes!"
     assert out_gumbel.shape == (batch_size, num_robots, latent_dim), \

@@ -1,0 +1,9 @@
+==========================================================================
+Starting Full 5-Seed × 300-Iteration Sweep (Dense vs Attention vs Random)
+Start time: Tue Sep 15 08:57:30 PM EDT 2026
+Each pair runs 2 parallel jobs (8 workers each, 16 workers total on 24 cores)
+==========================================================================
+
+[2026-09-15 20:57:30] Processing Pair: dense_s0 (done=0) & attn_s0 (done=0)...
+  -> Launching dense_s0 in background...
+  -> Launching attn_s0 in background...

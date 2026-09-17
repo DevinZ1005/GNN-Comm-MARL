@@ -34,27 +34,9 @@ def test_random_topk_deterministic_single_layer():
     # Pre-computed mask — same one used for both calls (mirrors PPO SGD replay)
     random_comm_mask = torch.rand(batch_size, num_nodes, num_nodes)
 
-    # Capture topk_indices from inside forward()
-    captured_indices = []
-    original_topk = torch.topk
-
-    def capturing_topk(*args, **kwargs):
-        result = original_topk(*args, **kwargs)
-        captured_indices.append(result.indices.clone())
-        return result
-
-    torch.topk = capturing_topk
-    try:
-        with torch.no_grad():
-            out1 = layer(node_features, adj_matrix, edge_features, random_comm_mask=random_comm_mask)
-            out2 = layer(node_features, adj_matrix, edge_features, random_comm_mask=random_comm_mask)
-    finally:
-        torch.topk = original_topk
-
-    assert len(captured_indices) >= 2, f"Expected at least 2 topk calls, got {len(captured_indices)}"
-
-    idx1 = captured_indices[0]
-    idx2 = captured_indices[1]
+    with torch.no_grad():
+        _, idx1 = layer(node_features, adj_matrix, edge_features, random_comm_mask=random_comm_mask)
+        _, idx2 = layer(node_features, adj_matrix, edge_features, random_comm_mask=random_comm_mask)
 
     assert torch.equal(idx1, idx2), (
         f"FAIL: Random-mode topk_indices differ between forward passes with same mask!\n"

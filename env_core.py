@@ -2,13 +2,13 @@
 Custom Multi-Agent Physics Environment Wrapper (`env_core.py`).
 
 This module defines `MultiRobotPhysicsEnv`, inheriting from Ray RLlib's `MultiAgentEnv`. It manages
-a physics simulation (via PyBullet) of N mobile robots tasked with collaboratively transporting a heavy
-payload across a rugged spatial environment to a target zone.
+a PyBullet surrogate or an explicitly selected simplified kinematic transport simulator.
+Neither backend models rugged terrain, radio transmission, or real robot hardware.
 
 Key Operational Components:
 1. Dynamic Graph Topology Engine:
    At every physics step, pairwise Euclidean distances d_ij = ||p_i - p_j||_2 are evaluated.
-   An edge (j, i) is established if d_ij <= R_comm and line-of-sight is maintained.
+   An edge (j, i) is established if d_ij <= R_comm; line-of-sight is not modeled.
    Edge features E_t[i, j] encode relative displacement vectors, relative velocity, and Euclidean distance.
 2. Potential-Based & Connectivity Reward Shaping:
    Ensures policy convergence and prevents graph fragmentation via a multi-objective reward structure:
@@ -47,11 +47,43 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         
         # Hyperparameters
         self.num_robots = int(self.config.get("num_robots", 4))
-        self.comm_radius = float(self.config.get("comm_radius", 5.0))
+        self.comm_radius = float(self.config.get("comm_radius", 1.8))
         self.max_steps = int(self.config.get("max_steps", 500))
         self.render_mode = self.config.get("render_mode", "headless")
         self.dt = float(self.config.get("dt", 1.0 / 240.0))
         self.physics_steps_per_env_step = int(self.config.get("physics_steps_per_env_step", 10))
+        self.backend = self.config.get("backend", "pybullet")
+        if self.backend not in ("pybullet", "kinematic"):
+            raise ValueError("backend must be pybullet or kinematic")
+        if self.backend == "pybullet" and not PYBULLET_AVAILABLE:
+            raise RuntimeError("PyBullet unavailable; explicitly select backend='kinematic' for the simplified simulator")
+        self.reward_version = self.config.get("reward_version", "transport_v2")
+        if self.reward_version not in ("transport_v2", "legacy"):
+            raise ValueError("Unknown reward_version")
+        self.spawn_radius = float(self.config.get("spawn_radius", 1.0))
+        self.spawn_jitter = float(self.config.get("spawn_jitter", 0.1))
+        self.goal_distance = float(self.config.get("goal_distance", 4.0))
+        self.success_radius = float(self.config.get("success_radius", 0.5))
+        self.step_cost = float(self.config.get("step_cost", 0.01))
+        self.progress_scale = float(self.config.get("progress_scale", 10.0))
+        self.approach_scale = float(self.config.get("approach_scale", 1.0))
+        self.energy_scale = float(self.config.get("energy_scale", 0.005))
+        self.contribution_scale = float(self.config.get("contribution_scale", 0.1))
+        self.min_payload_contacts = int(self.config.get("min_payload_contacts", 2))
+        configured_observers = int(self.config.get("goal_observers", self.num_robots))
+        self.goal_observers = self.num_robots if configured_observers < 0 else configured_observers
+        self.random_mask_scope = self.config.get("random_mask_scope", "step")
+        if self.random_mask_scope not in ("step", "episode"):
+            raise ValueError("random_mask_scope must be step or episode")
+        if (self.num_robots < 1 or self.max_steps < 1 or self.dt <= 0
+                or self.physics_steps_per_env_step < 1 or self.comm_radius <= 0
+                or self.spawn_radius <= 0 or self.spawn_jitter < 0
+                or self.success_radius <= 0 or self.goal_distance <= self.success_radius
+                or self.step_cost < 0 or self.progress_scale <= 0
+                or self.approach_scale < 0 or self.energy_scale < 0 or self.contribution_scale < 0
+                or not 1 <= self.min_payload_contacts <= self.num_robots
+                or not 1 <= self.goal_observers <= self.num_robots):
+            raise ValueError("Invalid environment dimensions, timing, or task configuration")
 
         # Contact radius for cooperative bonus and payload fallback dynamics
         self.contact_radius = float(self.config.get("contact_radius", 1.5))
@@ -69,7 +101,8 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         )
 
         # Dimensions
-        self.raw_obs_dim = 24  # [pos(3), vel(3), lidar(12), goal_rel(3), payload_rel(3)]
+        # pos, velocity, lidar, private goal, payload, sin/cos heading, goal-observer flag
+        self.raw_obs_dim = 27
         self.edge_dim = 8      # [rel_pos(3), rel_vel(3), dist(1), normalized_heading(1)]
         self.action_dim = 2    # Differential drive: [left_wheel_vel, right_wheel_vel]
 
@@ -113,7 +146,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
 
     def _setup_physics_engine(self) -> None:
         """Connects to PyBullet and sets up gravity and ground plane."""
-        if not PYBULLET_AVAILABLE:
+        if self.backend == "kinematic":
             return
         if self.physics_client is None:
             connection_mode = p.GUI if self.render_mode == "gui" else p.DIRECT
@@ -133,22 +166,37 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         Returns:
             Tuple of (observation_dict, info_dict).
         """
-        if seed is not None:
-            np.random.seed(seed)
+        super().reset(seed=seed, options=options)
         self.step_count = 0
+        rotation = self.np_random.uniform(-np.pi, np.pi)
+        self.goal_pos = np.array([self.goal_distance * np.cos(rotation),
+                                  self.goal_distance * np.sin(rotation), 0.2], dtype=np.float32)
+        angles = rotation + np.arange(self.num_robots) * 2 * np.pi / self.num_robots
+        positions = np.column_stack((self.spawn_radius * np.cos(angles),
+                                     self.spawn_radius * np.sin(angles),
+                                     np.full(self.num_robots, 0.25)))
+        positions[:, :2] += self.np_random.uniform(-self.spawn_jitter, self.spawn_jitter,
+                                                  (self.num_robots, 2))
+        headings = self.np_random.uniform(-np.pi, np.pi, self.num_robots)
+        self.goal_observer_mask = np.zeros(self.num_robots, dtype=np.float32)
+        observer_ids = self.np_random.choice(self.num_robots, self.goal_observers, replace=False)
+        self.goal_observer_mask[observer_ids] = 1.0
 
         if PYBULLET_AVAILABLE and self.physics_client is not None:
             p.resetSimulation(physicsClientId=self.physics_client)
             p.setGravity(0, 0, -9.81, physicsClientId=self.physics_client)
+            p.setTimeStep(self.dt, physicsClientId=self.physics_client)
             p.loadURDF("plane.urdf", physicsClientId=self.physics_client)
 
             # Spawn robots in a circular or grid pattern around origin
             self.robot_body_ids = []
             for i in range(self.num_robots):
                 angle = 2.0 * np.pi * i / self.num_robots
-                pos = [2.0 * np.cos(angle), 2.0 * np.sin(angle), 0.1]
+                pos = positions[i].tolist()
                 # Load simple sphere or R2D2 body as surrogate differential drive robot
                 body_id = p.loadURDF("sphere2.urdf", basePosition=pos, globalScaling=0.5, physicsClientId=self.physics_client)
+                p.resetBasePositionAndOrientation(body_id, pos,
+                    p.getQuaternionFromEuler([0, 0, float(headings[i])]), physicsClientId=self.physics_client)
                 self.robot_body_ids.append(body_id)
 
             # Spawn cooperative transport payload at origin
@@ -157,9 +205,9 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             # Kinematic fallback if PyBullet is unavailable during CI/testing
             for i in range(self.num_robots):
                 angle = 2.0 * np.pi * i / self.num_robots
-                self.robot_positions[i] = [2.0 * np.cos(angle), 2.0 * np.sin(angle), 0.1]
+                self.robot_positions[i] = positions[i]
                 self.robot_velocities[i] = [0.0, 0.0, 0.0]
-            self.robot_headings.fill(0.0)
+            self.robot_headings[:] = headings
             self.payload_pos = np.array([0.0, 0.0, 0.2], dtype=np.float32)
 
         # Update physical state and construct graph topology
@@ -167,8 +215,15 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         
         # Calculate initial payload-to-goal distance for potential-based progress tracking
         payload_coords = self._get_payload_position()
-        self.prev_payload_dist = float(np.linalg.norm(payload_coords - self.goal_pos))
-        self._reward_totals = {"progress": 0.0, "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
+        self.prev_payload_dist = float(np.linalg.norm(payload_coords[:2] - self.goal_pos[:2]))
+        self.initial_payload_dist = self.prev_payload_dist
+        self.prev_mean_robot_payload_dist = float(np.linalg.norm(
+            self.robot_positions[:, :2] - payload_coords[None, :2], axis=1).mean())
+        self.action_effort = 0.0
+        self.active_payload_contacts = int(np.sum(np.linalg.norm(
+            self.robot_positions[:, :2] - payload_coords[None, :2], axis=1) < self.contact_radius))
+        self._reward_totals = {"progress": 0.0, "approach": 0.0, "contribution": 0.0,
+                               "conn": 0.0, "contact": 0.0, "energy": 0.0, "completion": 0.0}
 
         # Build agent observations
         obs_dict = {}
@@ -177,7 +232,8 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
 
         # Draw a single random comm mask for this env step — shared across all agents
         # so every agent's obs snapshot references the same random topology.
-        random_comm_mask = np.random.rand(self.num_robots, self.num_robots).astype(np.float32)
+        self._episode_comm_scores = self.np_random.random((self.num_robots, self.num_robots)).astype(np.float32)
+        random_comm_mask = self._episode_comm_scores
 
         for idx, agent_id in enumerate(self._agent_ids):
             obs_dict[agent_id] = {
@@ -206,6 +262,12 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             Tuple of (obs_dict, reward_dict, terminated_dict, truncated_dict, info_dict).
         """
         self.step_count += 1
+        action_dict = {key: np.clip(np.asarray(value, dtype=np.float32), -1, 1)
+                       for key, value in action_dict.items()}
+        if any(value.shape != (self.action_dim,) or not np.isfinite(value).all()
+               for value in action_dict.values()):
+            raise ValueError("Actions must be finite vectors of length two")
+        self.action_effort += sum(float(np.square(value).sum()) for value in action_dict.values())
 
         # 1. Apply motor actions across physics substeps
         if PYBULLET_AVAILABLE and self.physics_client is not None:
@@ -223,11 +285,20 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
 
         # 3. Compute structured reward components
         payload_coords = self._get_payload_position()
-        curr_payload_dist = float(np.linalg.norm(payload_coords - self.goal_pos))
+        curr_payload_dist = float(np.linalg.norm(payload_coords[:2] - self.goal_pos[:2]))
+        self.active_payload_contacts = int(np.sum(np.linalg.norm(
+            self.robot_positions[:, :2] - payload_coords[None, :2], axis=1) < self.contact_radius))
         
-        # Potential-based progress difference: R_progress = gamma * Phi(s_t) - Phi(s_{t-1})
-        progress_reward = 10.0 * (self.prev_payload_dist - curr_payload_dist)
+        # Distance progress shaping; not policy-invariant potential shaping for gamma < 1.
+        progress_reward = self.progress_scale * (self.prev_payload_dist - curr_payload_dist)
         self.prev_payload_dist = curr_payload_dist
+        mean_robot_payload_dist = float(np.linalg.norm(
+            self.robot_positions[:, :2] - payload_coords[None, :2], axis=1).mean())
+        approach_reward = self.approach_scale * (
+            self.prev_mean_robot_payload_dist - mean_robot_payload_dist)
+        self.prev_mean_robot_payload_dist = mean_robot_payload_dist
+        goal_delta = self.goal_pos[:2] - payload_coords[:2]
+        goal_unit = goal_delta / max(float(np.linalg.norm(goal_delta)), 1e-8)
 
         # Compute algebraic connectivity (Fiedler value lambda_2 of Graph Laplacian L = D - A)
         # Uses scipy.linalg.eigh for symmetric matrices: guarantees real eigenvalues,
@@ -248,11 +319,13 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         all_node_features = self._extract_all_node_features()
 
         # Check task completion threshold
-        if curr_payload_dist < 1.0:
+        if curr_payload_dist < self.success_radius:
             terminated_dict["__all__"] = True
+            truncated_dict["__all__"] = False
 
         # Draw a single random comm mask for this env step — shared across all agents
-        random_comm_mask = np.random.rand(self.num_robots, self.num_robots).astype(np.float32)
+        random_comm_mask = (self._episode_comm_scores if self.random_mask_scope == "episode"
+                            else self.np_random.random((self.num_robots, self.num_robots)).astype(np.float32))
 
         for idx, agent_id in enumerate(self._agent_ids):
             obs_dict[agent_id] = {
@@ -267,7 +340,7 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
             # Individual reward shaping per robot
             # r_i = progress + cooperative contact bonus + connectivity retention - energy regularizer
             action_norm = float(np.linalg.norm(action_dict.get(agent_id, np.zeros(self.action_dim))))
-            energy_penalty = 0.05 * (action_norm ** 2)
+            energy_penalty = self.energy_scale * (action_norm ** 2)
             
             # Connectivity penalty: exponential drop if isolated
             neighbor_count = np.sum(self.adj_matrix[idx])
@@ -278,9 +351,23 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
                 self.robot_positions[idx][:2] - payload_coords[:2]
             ))
             coop_contact = self.contact_bonus if payload_dist_i < self.contact_radius else 0.0
+            contribution_reward = 0.0
+            if self.reward_version == "transport_v2":
+                conn_penalty = 0.0
+                coop_contact = 0.0
+                if (payload_dist_i < self.contact_radius
+                        and self.active_payload_contacts >= self.min_payload_contacts):
+                    contact_weight = max(0.0, 1.0 - payload_dist_i / self.contact_radius)
+                    contribution_reward = self.contribution_scale * contact_weight * float(
+                        np.dot(self.robot_velocities[idx, :2], goal_unit))
 
-            reward_dict[agent_id] = progress_reward + conn_penalty + coop_contact - energy_penalty
+            reward_dict[agent_id] = (progress_reward + approach_reward + conn_penalty
+                                     + coop_contact + contribution_reward - energy_penalty)
+            if self.reward_version == "transport_v2":
+                reward_dict[agent_id] -= self.step_cost
             self._reward_totals["progress"] += progress_reward
+            self._reward_totals["approach"] += approach_reward
+            self._reward_totals["contribution"] += contribution_reward
             self._reward_totals["conn"] += conn_penalty
             self._reward_totals["contact"] += coop_contact
             self._reward_totals["energy"] -= energy_penalty
@@ -293,6 +380,16 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
                 "neighbor_count": int(neighbor_count),
                 "contact": payload_dist_i < self.contact_radius
             }
+            info_dict[agent_id].update(
+                success=bool(terminated_dict["__all__"]),
+                payload_progress=self.initial_payload_dist - curr_payload_dist,
+                action_effort=self.action_effort / self.num_robots,
+                active_contacts=int(self.active_payload_contacts),
+                goal_observer=bool(self.goal_observer_mask[idx]),
+                mean_robot_payload_distance=mean_robot_payload_dist,
+                transport_contribution=contribution_reward,
+                backend=self.backend, reward_version=self.reward_version,
+            )
 
         # Terminal completion reward: sparse bonus for all agents on task success
         if terminated_dict["__all__"]:
@@ -300,8 +397,10 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
                 reward_dict[agent_id] = reward_dict.get(agent_id, 0.0) + self.completion_bonus
             self._reward_totals["completion"] += self.completion_bonus * self.num_robots
 
-        if terminated_dict["__all__"] or truncated_dict["__all__"]:
+        if self.config.get("log_episodes", False) and (terminated_dict["__all__"] or truncated_dict["__all__"]):
             print(f"[EP END] progress={self._reward_totals['progress']:.2f} "
+                  f"approach={self._reward_totals['approach']:.2f} "
+                  f"contribution={self._reward_totals['contribution']:.2f} "
                   f"conn={self._reward_totals['conn']:.2f} "
                   f"contact={self._reward_totals['contact']:.2f} "
                   f"energy={self._reward_totals['energy']:.2f} "
@@ -373,7 +472,8 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
                 w = max(0.0, 1.0 - dist_to_payload / self.contact_radius)
                 weights.append(w)
                 vel_contributions.append(w * self.robot_velocities[i])
-        if weights:
+        self.active_payload_contacts = len(weights)
+        if len(weights) >= self.min_payload_contacts:
             total_w = sum(weights)
             payload_vel = sum(vel_contributions) / total_w
             self.payload_pos += payload_vel * dt_step
@@ -481,6 +581,10 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         node_feats[:, 3:6] = self.robot_velocities
         node_feats[:, 18:21] = self.goal_pos - self.robot_positions
         node_feats[:, 21:24] = payload_pos - self.robot_positions
+        node_feats[:, 24] = np.sin(self.robot_headings)
+        node_feats[:, 25] = np.cos(self.robot_headings)
+        node_feats[:, 26] = self.goal_observer_mask
+        node_feats[self.goal_observer_mask == 0, 18:21] = 0.0
 
         # Simulated LiDAR ray distances (6:18)
         for i in range(self.num_robots):
