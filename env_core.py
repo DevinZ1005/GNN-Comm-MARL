@@ -63,6 +63,9 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         self.spawn_radius = float(self.config.get("spawn_radius", 1.0))
         self.spawn_jitter = float(self.config.get("spawn_jitter", 0.1))
         self.goal_distance = float(self.config.get("goal_distance", 4.0))
+        self.goal_spawn_mode = self.config.get("goal_spawn_mode", "coupled")
+        if self.goal_spawn_mode not in ("coupled", "independent"):
+            raise ValueError("goal_spawn_mode must be coupled or independent")
         self.success_radius = float(self.config.get("success_radius", 0.5))
         self.step_cost = float(self.config.get("step_cost", 0.01))
         self.progress_scale = float(self.config.get("progress_scale", 10.0))
@@ -169,8 +172,12 @@ class MultiRobotPhysicsEnv(MultiAgentEnv):
         super().reset(seed=seed, options=options)
         self.step_count = 0
         rotation = self.np_random.uniform(-np.pi, np.pi)
-        self.goal_pos = np.array([self.goal_distance * np.cos(rotation),
-                                  self.goal_distance * np.sin(rotation), 0.2], dtype=np.float32)
+        # Coupled mode preserves historical seeded scenarios. Independent mode
+        # removes the deterministic cue from spawn-ring orientation to the goal.
+        goal_rotation = (self.np_random.uniform(-np.pi, np.pi)
+                         if self.goal_spawn_mode == "independent" else rotation)
+        self.goal_pos = np.array([self.goal_distance * np.cos(goal_rotation),
+                                  self.goal_distance * np.sin(goal_rotation), 0.2], dtype=np.float32)
         angles = rotation + np.arange(self.num_robots) * 2 * np.pi / self.num_robots
         positions = np.column_stack((self.spawn_radius * np.cos(angles),
                                      self.spawn_radius * np.sin(angles),

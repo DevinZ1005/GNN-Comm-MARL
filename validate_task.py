@@ -1,6 +1,8 @@
 """Validate transport feasibility and graph structure before RL experiments."""
 import argparse
+import hashlib
 import json
+from pathlib import Path
 
 import numpy as np
 
@@ -67,7 +69,9 @@ def validate(config, episodes=20, seed_start=70000):
         "mean_final_payload_distance": float(np.mean([row["final_payload_distance"] for row in rows])),
         "mean_payload_progress": float(np.mean([row["payload_progress"] for row in rows])),
     }
-    return {"environment": config, "episodes_per_controller": episodes,
+    return {"environment": config, "episodes_per_controller": episodes, "seed_start": seed_start,
+            "source_hashes": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                              for name in ("env_core.py", "validate_task.py")},
             "scripted": summarize(scripted), "random": summarize(random),
             "fraction_initial_partial_graphs": float(np.mean(
                 [row["initial_partial_graph"] for row in scripted])),
@@ -85,11 +89,17 @@ def main():
     parser.add_argument("--num-robots", type=int, default=8)
     parser.add_argument("--comm-radius", type=float, default=1.8)
     parser.add_argument("--goal-observers", type=int, default=-1)
+    parser.add_argument("--goal-spawn-mode", choices=["coupled", "independent"], default="coupled")
+    parser.add_argument("--max-steps", type=int, default=500)
+    parser.add_argument("--seed-start", type=int, default=70000)
     parser.add_argument("--output")
     args = parser.parse_args()
+    if args.episodes < 1:
+        parser.error("episodes must be positive")
     config = {"backend": "kinematic", "num_robots": args.num_robots,
-              "comm_radius": args.comm_radius, "goal_observers": args.goal_observers}
-    result = validate(config, args.episodes)
+              "comm_radius": args.comm_radius, "goal_observers": args.goal_observers,
+              "goal_spawn_mode": args.goal_spawn_mode, "max_steps": args.max_steps}
+    result = validate(config, args.episodes, args.seed_start)
     encoded = json.dumps(result, indent=2, allow_nan=False)
     if args.output:
         with open(args.output, "x") as stream:

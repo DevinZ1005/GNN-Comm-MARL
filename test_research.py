@@ -2,14 +2,18 @@
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 import json
+import shlex
+import subprocess
+import sys
 
 import numpy as np
 import torch
 
 from env_core import MultiRobotPhysicsEnv
 from gnn_comm_layer import EdgeConditionedGATLayer
-from marl_agent import GNNMARLModel
+from marl_agent import GNNMARLModel, robot_frame_features
 from evaluate import evaluate, load_export, observation_batch, action_sensitivity
 from compare_evaluations import paired_comparison
 from validate_task import validate
@@ -91,6 +95,29 @@ class EnvironmentTests(unittest.TestCase):
         env.reset(seed=2)
         self.assertFalse(np.array_equal(goal, env.goal_pos))
 
+    def test_goal_spawn_independence_and_legacy_replay(self):
+        default = self.make_env(num_robots=8)
+        coupled = self.make_env(num_robots=8, goal_spawn_mode="coupled")
+        original, _ = default.reset(seed=81)
+        explicit, _ = coupled.reset(seed=81)
+        for key in original["robot_0"]:
+            np.testing.assert_array_equal(original["robot_0"][key], explicit["robot_0"][key])
+        env = self.make_env(num_robots=8, goal_spawn_mode="independent", spawn_jitter=0,
+                            goal_observers=1)
+        offsets = []
+        for seed in range(128):
+            obs, _ = env.reset(seed=seed)
+            goal_angle = np.arctan2(env.goal_pos[1], env.goal_pos[0])
+            ring_angle = np.arctan2(env.robot_positions[0, 1], env.robot_positions[0, 0])
+            offsets.append(np.exp(1j * (goal_angle - ring_angle)))
+            features = obs["robot_0"]["node_features"]
+            self.assertTrue(np.all(features[features[:, 26] == 0, 18:21] == 0))
+        # The old cue gives a fixed zero offset (resultant magnitude one).
+        self.assertLess(abs(np.mean(offsets)), 0.2)
+        a, _ = env.reset(seed=17)
+        b, _ = env.reset(seed=17)
+        np.testing.assert_array_equal(a["robot_0"]["node_features"], b["robot_0"]["node_features"])
+
     def test_transport_contribution_has_correct_direction(self):
         toward, away = self.make_env(spawn_jitter=0), self.make_env(spawn_jitter=0)
         toward.reset(seed=8)
@@ -158,7 +185,151 @@ class RoutingTests(unittest.TestCase):
             torch.testing.assert_close(layers[0].last_selected_mask, layers[1].last_selected_mask)
 
 
+class SweepTests(unittest.TestCase):
+    def test_matched_schedule_and_private_goal_guard(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = [sys.executable, str(Path(__file__).with_name("run_sweep.py")),
+                    "--root", root, "--backend", "kinematic", "--seeds", "104", "105",
+                    "--conditions", "dense", "no_comm", "--observation-frame", "robot",
+                    "--iterations", "40", "--max-steps", "250", "--train-batch-size", "512",
+                    "--epochs", "2", "--gnn-num-layers", "1", "--development-episodes", "50"]
+            result = subprocess.run(base, text=True, capture_output=True, check=True)
+            commands = [shlex.split(line) for line in result.stdout.splitlines()]
+            training = [cmd for cmd in commands if any(v.endswith("train.py") for v in cmd)]
+            self.assertEqual(len(training), 4)
+            self.assertEqual(len(commands), 8)
+            for cmd in training:
+                self.assertEqual(cmd[cmd.index("--observation-frame") + 1], "robot")
+                self.assertEqual(cmd[cmd.index("--max-steps") + 1], "250")
+                self.assertEqual(cmd[cmd.index("--train-batch-size") + 1], "512")
+            self.assertEqual(sum("--no-comm" in cmd for cmd in training), 2)
+            rejected = subprocess.run(base + ["--goal-observers", "1"], text=True, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("private-goal sweeps require", rejected.stderr)
+            accepted = subprocess.run(base + ["--goal-observers", "1", "--goal-spawn-mode", "independent"],
+                                      text=True, capture_output=True)
+            self.assertEqual(accepted.returncode, 0)
+            self.assertEqual(list(Path(root).iterdir()), [])
+
+
 class EvaluationTests(unittest.TestCase):
+    def test_hidden_goal_only_reaches_actors_through_local_observation_or_edges(self):
+        torch.manual_seed(23)
+        env = MultiRobotPhysicsEnv({"backend": "kinematic", "num_robots": 8,
+            "goal_observers": 1, "goal_spawn_mode": "independent"})
+        self.addCleanup(env.close)
+        obs, _ = env.reset(seed=77)
+        before = observation_batch(obs)
+        observer = int(np.flatnonzero(env.goal_observer_mask)[0])
+        uninformed = before["local_obs"][:, 26] == 0
+        reachable = before["adj_matrix"][0, :, observer].bool()
+        self.assertTrue((uninformed & reachable).any())
+        self.assertTrue((uninformed & ~reachable).any())
+
+        # Counterfactual snapshot: only the private goal changes, no physics step.
+        env.goal_pos[:2] *= -1
+        features = env._extract_all_node_features()
+        for i, agent in enumerate(obs):
+            obs[agent].update(local_obs=features[i].copy(), node_features=features.copy())
+        after = observation_batch(obs)
+        torch.testing.assert_close(before["local_obs"][uninformed], after["local_obs"][uninformed])
+
+        for no_comm, remove_edges in ((True, False), (False, True), (False, False)):
+            model = GNNMARLModel(None, None, 4, {"custom_model_config": {
+                "observation_frame": "robot", "gnn_num_layers": 1, "no_comm": no_comm}}, "test")
+            model.eval()
+            a, b = dict(before), dict(after)
+            if remove_edges:
+                a["adj_matrix"] = torch.zeros_like(before["adj_matrix"])
+                b["adj_matrix"] = torch.zeros_like(after["adj_matrix"])
+            original, _ = model.forward({"obs": a}, [], None)
+            changed, _ = model.forward({"obs": b}, [], None)
+            protected = uninformed if no_comm or remove_edges else uninformed & ~reachable
+            torch.testing.assert_close(original[protected], changed[protected], atol=1e-7, rtol=1e-6)
+            if not no_comm and not remove_edges:
+                self.assertGreater(float((original[uninformed & reachable] -
+                                          changed[uninformed & reachable]).detach().abs().max()), 1e-6)
+
+    def test_entropy_uses_each_actors_routing_rows(self):
+        import analyze_attention_entropy as analysis
+        torch.manual_seed(44)
+        config = {"observation_frame": "robot", "top_k": 1, "gnn_num_layers": 1}
+        model = GNNMARLModel(None, None, 4, {"custom_model_config": config}, "test")
+        env_config = {"backend": "kinematic", "num_robots": 8, "max_steps": 3}
+        expected = np.zeros((8, 8), dtype=int)
+
+        def record(*args):
+            layer = model.gnn_layer.gat_layers[0]
+            rows = torch.arange(8)
+            expected[:] += layer.last_selected_mask[rows, rows].cpu().numpy()
+
+        evaluate(model, env_config, [18], trajectory_callback=record)
+        payload = {"env_config": env_config, "model_config": config,
+                   "training_seed": 44, "iteration": 0}
+        with patch.object(analysis, "load_export", return_value=(model, payload)):
+            result = analysis.analyze("unused.pt", episodes=1, seed_start=18)
+        np.testing.assert_array_equal(result["selected_counts"], expected)
+        self.assertEqual(result["model_config"]["observation_frame"], "robot")
+
+    def test_robot_frame_rotation_translation_and_private_goals(self):
+        env = MultiRobotPhysicsEnv({"backend": "kinematic", "num_robots": 4,
+                                    "goal_observers": 1})
+        self.addCleanup(env.close)
+        obs, _ = env.reset(seed=14)
+        original = observation_batch(obs)
+        framed = robot_frame_features(original["local_obs"], original["node_features"],
+                                      original["edge_features"])
+        self.assertTrue(torch.all(framed[0][:, :2] == 0))
+        self.assertTrue(torch.all(framed[0][original["local_obs"][:, 26] == 0, 18:21] == 0))
+        angle = 1.37
+        rotation = np.array([[np.cos(angle), -np.sin(angle)],
+                             [np.sin(angle), np.cos(angle)]], dtype=np.float32)
+        for positions in (env.robot_positions, env.payload_pos[None], env.goal_pos[None]):
+            positions[:, :2] = positions[:, :2] @ rotation.T + [2.0, -3.0]
+        env.robot_velocities[:, :2] = env.robot_velocities[:, :2] @ rotation.T
+        env.robot_headings += angle
+        env._update_kinematics_and_graph()
+        features = env._extract_all_node_features()
+        for i, agent in enumerate(obs):
+            obs[agent].update(local_obs=features[i].copy(), node_features=features.copy(),
+                              adj_matrix=env.adj_matrix.copy(), edge_features=env.edge_features.copy())
+        rotated = observation_batch(obs)
+        for mode, top_k, no_comm in (("attention", None, False), ("attention", 2, False),
+                                    ("random", 2, False), ("distance", 2, False),
+                                    ("gumbel", 2, False), ("attention", None, True)):
+            model = GNNMARLModel(None, None, 4, {"custom_model_config": {
+                "observation_frame": "robot", "top_k": top_k, "topk_mode": mode,
+                "no_comm": no_comm}}, "test")
+            model.eval()
+            before, _ = model.forward({"obs": original}, [], None)
+            value = model.value_function().clone()
+            after, _ = model.forward({"obs": rotated}, [], None)
+            torch.testing.assert_close(before, after, atol=2e-6, rtol=2e-5)
+            torch.testing.assert_close(value, model.value_function(), atol=2e-6, rtol=2e-5)
+            (after.square().mean() + model.value_function().square().mean()).backward()
+            self.assertTrue(all(torch.isfinite(p.grad).all() for p in model.parameters()
+                                if p.grad is not None))
+
+    def test_trajectory_recording_and_horizon_prefix(self):
+        from diagnose_transport import trajectory_row, summarize_trajectory
+        model = GNNMARLModel(None, None, 4, {"custom_model_config": {}}, "test")
+        config = {"backend": "kinematic", "max_steps": 3}
+        plain, _ = evaluate(model, config, [12])
+        traces = []
+        recorded, _ = evaluate(model, config, [12], trajectory_callback=lambda *args:
+                               traces.append(trajectory_row(*args)))
+        plain[0].pop("inference_seconds")
+        recorded[0].pop("inference_seconds")
+        self.assertEqual(plain, recorded)
+        longer = []
+        evaluate(model, dict(config, max_steps=6), [12], trajectory_callback=lambda *args:
+                 longer.append(trajectory_row(*args)))
+        self.assertEqual(traces, longer[:3])
+        self.assertEqual([r["step"] for r in traces], [1, 2, 3])
+        summary = summarize_trajectory(traces, False, 2)
+        self.assertEqual(summary["final_distance"], recorded[0]["final_payload_distance"])
+        json.dumps(summary, allow_nan=False)
+
     def test_paired_statistics_and_reject_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             left, right = [], []
@@ -173,12 +344,37 @@ class EvaluationTests(unittest.TestCase):
                     paths.append(path)
             result = paired_comparison(left, right, "success")
             self.assertEqual(result["mean_difference"], 1)
+            self.assertEqual(result["seed_ids"], [0, 1])
+            self.assertEqual(result["left_means"], [1, 1])
             self.assertEqual(result["bootstrap_95_interval"], [1, 1])
             data = json.loads(right[0].read_text())
             data["env_steps"] = 99
             right[0].write_text(json.dumps(data))
             with self.assertRaises(ValueError):
                 paired_comparison(left, right, "success")
+
+    def test_comparison_rejects_cross_seed_architecture_and_scenario_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            groups = [[], []]
+            for seed in (0, 1):
+                for condition in (0, 1):
+                    data = {"training_seed": seed, "env_config": {}, "protocol": {},
+                            "iteration": 40, "env_steps": 20480, "training_protocol": {},
+                            "source_hashes": {}, "evaluation_source_hashes": {},
+                            "model_config": {"observation_frame": "robot" if seed == 0 else "world"},
+                            "episodes": [{"episode_seed": 80000, "success": True}]}
+                    path = Path(tmp) / f"{condition}_{seed}.json"
+                    path.write_text(json.dumps(data))
+                    groups[condition].append(path)
+            with self.assertRaisesRegex(ValueError, "Mixed model architecture"):
+                paired_comparison(*groups, "success")
+            for path in (groups[0][1], groups[1][1]):
+                data = json.loads(path.read_text())
+                data["model_config"]["observation_frame"] = "robot"
+                data["episodes"][0]["episode_seed"] = 90000
+                path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "Mixed evaluation episode seeds"):
+                paired_comparison(*groups, "success")
 
     def test_robustness_and_larger_team(self):
         model = GNNMARLModel(None, None, 4, {"custom_model_config": {"top_k": 2}}, "test")
@@ -188,7 +384,7 @@ class EvaluationTests(unittest.TestCase):
         self.assertTrue(np.isfinite(rows[0]["return_per_agent"]))
 
     def test_export_roundtrip_and_repeatability(self):
-        config = {"top_k": 1, "topk_mode": "gumbel"}
+        config = {"top_k": 1, "topk_mode": "gumbel", "observation_frame": "robot"}
         model = GNNMARLModel(None, None, 4, {"custom_model_config": config}, "test")
         env_config = {"backend": "kinematic", "num_robots": 4, "max_steps": 3}
         with tempfile.TemporaryDirectory() as tmp:
@@ -217,14 +413,20 @@ class EvaluationTests(unittest.TestCase):
         self.assertFalse(torch.equal(old_value, model.value_function()))
 
     def test_ablation_clears_intervention(self):
-        model = GNNMARLModel(None, None, 4, {"custom_model_config": {"top_k": 1}}, "test")
+        model = GNNMARLModel(None, None, 4, {"custom_model_config": {
+            "top_k": 1, "observation_frame": "robot"}}, "test")
         env = MultiRobotPhysicsEnv({"backend": "kinematic"})
         self.addCleanup(env.close)
         obs, _ = env.reset(seed=0)
         batch = observation_batch(obs)
         before, _ = model.forward({"obs": batch}, [], None)
+        layer = model.gnn_layer.gat_layers[0]
+        expected = {(i, j): float(layer.last_attention_scores[i, i, j])
+                    for i in range(env.num_robots)
+                    for j in range(env.num_robots) if layer.last_selected_mask[i, i, j]}
         rows = action_sensitivity(model, batch)
         self.assertTrue(rows)
+        self.assertEqual({(r["receiver"], r["sender"]): r["attention_score"] for r in rows}, expected)
         after, _ = model.forward({"obs": batch}, [], None)
         torch.testing.assert_close(before, after)
 

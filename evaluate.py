@@ -45,21 +45,26 @@ def action_sensitivity(model, batch):
     """Direct first-layer message intervention; NOT task-return causal value."""
     base, _ = model.forward({"obs": batch}, [], None)
     layer = model.gnn_layer.gat_layers[0]
-    selected = layer.last_selected_mask[0].clone()
-    scores = layer.last_attention_scores[0].clone()
+    # Robot-relative graphs differ across focal actors. Inspect each actor's own
+    # receiver row, rather than all receiver rows from robot zero's graph.
+    indices = batch["node_index"].reshape(-1).long()
+    batch_rows = torch.arange(len(indices), device=indices.device)
+    selected = layer.last_selected_mask[batch_rows, indices].clone()
+    scores = layer.last_attention_scores[batch_rows, indices].clone()
     rows = []
-    for receiver, sender in selected.nonzero().tolist():
+    for actor_row, sender in selected.nonzero().tolist():
+        receiver = int(indices[actor_row])
         layer.message_ablation = (receiver, sender)
         try:
             altered, _ = model.forward({"obs": batch}, [], None)
             # Gaussian means and log stds are recorded separately; sensitivity
             # alone does not establish whether a message is beneficial.
             rows.append({"receiver": receiver, "sender": sender,
-                         "attention_score": float(scores[receiver, sender]),
+                         "attention_score": float(scores[actor_row, sender]),
                          "mean_action_change": float(torch.linalg.vector_norm(
-                             altered[receiver, :2] - base[receiver, :2])),
+                             altered[actor_row, :2] - base[actor_row, :2])),
                          "log_std_change": float(torch.linalg.vector_norm(
-                             altered[receiver, 2:] - base[receiver, 2:]))})
+                             altered[actor_row, 2:] - base[actor_row, 2:]))})
         finally:
             layer.message_ablation = None
     model.forward({"obs": batch}, [], None)
@@ -68,7 +73,7 @@ def action_sensitivity(model, batch):
 
 @torch.no_grad()
 def evaluate(model, env_config, seeds, *, candidate_loss=0.0, delay=0, noise=0.0,
-             diagnostic_interval=0):
+             diagnostic_interval=0, trajectory_callback=None):
     if not 0 <= candidate_loss <= 1 or delay < 0 or noise < 0:
         raise ValueError("Invalid robustness settings")
     env = MultiRobotPhysicsEnv(env_config)
@@ -107,8 +112,11 @@ def evaluate(model, env_config, seeds, *, candidate_loss=0.0, delay=0, noise=0.0
                 # RLlib's normalized Gaussian mean is mapped to [-1,1], then clipped.
                 actions = {agent: logits[i, :2].cpu().numpy().clip(-1, 1)
                            for i, agent in enumerate(obs)}
+                before = env._get_payload_position().copy() if trajectory_callback else None
                 obs, rewards, terminated, truncated, infos = env.step(actions)
                 reward += sum(rewards.values()) / env.num_robots
+                if trajectory_callback is not None:
+                    trajectory_callback(int(seed), step + 1, env, actions, before, infos)
                 if terminated["__all__"] or truncated["__all__"]:
                     break
             info = next(iter(infos.values()))

@@ -4,6 +4,7 @@ Entropy measures concentration, not message usefulness or causality.
 Requires a complete portable export; legacy partial weights are rejected.
 """
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -33,9 +34,12 @@ def analyze(path, episodes=10, seed_start=60000):
                 batch = observation_batch(obs)
                 logits, _ = model.forward({"obs": batch}, [], None)
                 layer = model.gnn_layer.gat_layers[0]
-                valid = batch["adj_matrix"][0].bool()
-                scores = layer.last_attention_scores[0]
-                selected = layer.last_selected_mask[0]
+                indices = batch["node_index"].reshape(-1).long()
+                actor_rows = torch.arange(len(indices), device=indices.device)
+                # Each actor's robot-relative graph uses a different coordinate frame.
+                valid = batch["adj_matrix"][actor_rows, indices].bool()
+                scores = layer.last_attention_scores[actor_rows, indices]
+                selected = layer.last_selected_mask[actor_rows, indices]
                 selected_counts += selected.numpy()
                 available_counts += valid.numpy().astype(int)
                 for node in range(env.num_robots):
@@ -49,7 +53,7 @@ def analyze(path, episodes=10, seed_start=60000):
                     if 0 < k < degree:
                         ordered = values.sort(descending=True).values
                         margins.append(float(ordered[k - 1] - ordered[k]))
-                        random_scores = batch["random_comm_mask"][0, node].masked_fill(~valid[node], -float("inf"))
+                        random_scores = batch["random_comm_mask"][node, indices[node]].masked_fill(~valid[node], -float("inf"))
                         random_set = torch.zeros_like(valid[node]).scatter(0, random_scores.topk(k).indices, True)
                         overlaps.append(float((random_set & selected[node]).sum()) / k)
                 if previous is not None:
@@ -64,6 +68,11 @@ def analyze(path, episodes=10, seed_start=60000):
         env.close()
     mean = lambda values: float(np.mean(values)) if values else None
     return {"checkpoint": str(Path(path).resolve()), "episodes": episodes, "seed_start": seed_start,
+            "training_seed": payload["training_seed"], "iteration": payload["iteration"],
+            "model_config": payload["model_config"], "env_config": payload["env_config"],
+            "analysis_source_hashes": {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                for name in ("analyze_attention_entropy.py", "evaluate.py", "env_core.py",
+                             "marl_agent.py", "gnn_comm_layer.py")},
             "normalized_neighbor_score_entropy": mean(entropies),
             "topk_boundary_score_margin": mean(margins),
             "overlap_with_observation_random_topk": mean(overlaps),

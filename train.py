@@ -48,10 +48,14 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--top-k-anneal-steps", type=int, default=None, help="Number of training iterations to anneal top_k from dense to target.")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility")
     parser.add_argument("--gnn-num-layers", type=int, default=2, help="Number of GAT message-passing layers.")
+    parser.add_argument("--observation-frame", choices=["world", "robot"], default="world",
+                        help="Actor coordinate frame; robot mode requires fresh training.")
     parser.add_argument("--no-comm", action="store_true", help="Zero actor communication; retain the shared centralized critic design.")
     parser.add_argument("--backend", choices=["pybullet", "kinematic"], default="pybullet")
     parser.add_argument("--reward-version", choices=["transport_v2", "legacy"], default="transport_v2")
     parser.add_argument("--goal-distance", type=float, default=4.0)
+    parser.add_argument("--goal-spawn-mode", choices=["coupled", "independent"], default="coupled",
+                        help="Use independent for private-goal studies; coupled preserves old scenarios.")
     parser.add_argument("--spawn-radius", type=float, default=1.0)
     parser.add_argument("--spawn-jitter", type=float, default=0.1)
     parser.add_argument("--goal-observers", type=int, default=-1,
@@ -145,7 +149,8 @@ def main() -> None:
     env_config = {key: getattr(args, key) for key in (
         "num_robots", "comm_radius", "backend", "reward_version", "goal_distance",
         "spawn_radius", "spawn_jitter", "goal_observers", "min_payload_contacts",
-        "approach_scale", "energy_scale", "contribution_scale", "max_steps", "random_mask_scope")}
+        "approach_scale", "energy_scale", "contribution_scale", "max_steps", "random_mask_scope",
+        "goal_spawn_mode")}
     env_config["render_mode"] = "gui" if args.render else "headless"
     source_hashes = {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
                      for name in ("env_core.py", "gnn_comm_layer.py", "marl_agent.py", "train.py", "evaluate.py")}
@@ -218,6 +223,7 @@ def main() -> None:
                     "gumbel_temperature": args.gumbel_temperature,
                     "top_k_anneal_steps": args.top_k_anneal_steps,
                     "no_comm": args.no_comm,
+                    "observation_frame": args.observation_frame,
                 }
             }
         )

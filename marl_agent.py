@@ -26,6 +26,36 @@ from ray.rllib.utils.typing import TensorType, ModelConfigDict
 from gnn_comm_layer import DynamicTopologicalGNN
 
 
+def robot_frame_features(local, nodes, edges):
+    """Express each actor's graph in its own XY position and heading frame.
+
+    Uses only the focal robot's pose to choose the frame. Masked goal vectors,
+    body-relative lidar, adjacency and random routing scores are preserved.
+    """
+    sine, cosine = local[:, 24], local[:, 25]
+
+    def rotate(vectors):
+        shape = (-1,) + (1,) * (vectors.dim() - 2)
+        s, c = sine.reshape(shape), cosine.reshape(shape)
+        x, y = vectors[..., 0], vectors[..., 1]
+        return torch.stack((c * x + s * y, -s * x + c * y), dim=-1)
+
+    def features(values):
+        result = values.clone()
+        result[..., :2] = rotate(values[..., :2] - local[:, None, :2])
+        for start in (3, 18, 21):
+            result[..., start:start + 2] = rotate(values[..., start:start + 2])
+        s, c = sine[:, None], cosine[:, None]
+        result[..., 24] = values[..., 24] * c - values[..., 25] * s
+        result[..., 25] = values[..., 25] * c + values[..., 24] * s
+        return result
+
+    framed_edges = edges.clone()
+    for start in (0, 3):
+        framed_edges[..., start:start + 2] = rotate(edges[..., start:start + 2])
+    return features(local[:, None, :]).squeeze(1), features(nodes), framed_edges
+
+
 class GNNMARLModel(TorchModelV2, nn.Module):
     """
     RLlib TorchModelV2 integrating local sensor processing with dynamic topological GNN communication.
@@ -74,6 +104,11 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         self.topk_mode = kwargs.get("topk_mode", custom_cfg.get("topk_mode", "attention"))
         self.gumbel_temperature = kwargs.get("gumbel_temperature", custom_cfg.get("gumbel_temperature", 1.0))
         self.no_comm = kwargs.get("no_comm", custom_cfg.get("no_comm", False))
+        self.observation_frame = custom_cfg.get("observation_frame", "world")
+        if self.observation_frame not in ("world", "robot"):
+            raise ValueError("observation_frame must be world or robot")
+        if self.observation_frame == "robot" and (self.raw_obs_dim != 27 or self.edge_dim != 8):
+            raise ValueError("robot observation frame requires the 27/8 feature schema")
 
         # If annealing is configured, start dense — the callback in train.py drives the ramp-down
         top_k_anneal_steps = kwargs.get("top_k_anneal_steps", custom_cfg.get("top_k_anneal_steps", None))
@@ -156,6 +191,9 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         adj_matrix = obs_dict["adj_matrix"].float()
         edge_features = obs_dict["edge_features"].float()
         random_comm_mask = obs_dict["random_comm_mask"].float()
+        if self.observation_frame == "robot":
+            local_obs, node_features, edge_features = robot_frame_features(
+                local_obs, node_features, edge_features)
         
         # node_index indicates which node in the graph corresponds to the evaluating agent
         node_index = obs_dict["node_index"].long()

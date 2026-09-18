@@ -55,6 +55,15 @@ Training defaults to CPU, one Torch thread and two rollout workers. Set `--gpus`
 `--torch-threads` and `--num-workers` explicitly to change resource use.
 A short smoke run validates software execution, not learned transport.
 
+`--observation-frame robot` is an opt-in representation experiment. Each actor's
+position, vector features, neighbor poses and edge vectors are expressed relative
+to its own XY pose; body-relative lidar and masked goals are preserved. This removes
+dependence on a common world rotation/translation without changing the task or reward.
+It uses the existing dense graph computation, not a deployed communication protocol.
+The default `world` frame preserves existing exports. Robot-frame policies require
+fresh training; do not reinterpret old world-frame weights as robot-frame weights.
+The frame is recorded in the model configuration and portable export.
+
 Continue a Ray checkpoint into a fresh, empty run directory with
 `--resume-from OLD_RUN/ray_00040`. In that mode, `--max-iterations` is the
 number of additional iterations. The new manifest records the source checkpoint.
@@ -64,10 +73,12 @@ Resuming restores RLlib training state but is not guaranteed to reproduce an uni
 run's environment trajectories or random-number stream exactly.
 
 `--goal-observers -1` gives every robot the goal. Positive counts mask the goal vector
-for other robots. The current spawn ring rotates with the goal, so this option alone
-does not establish a private-information task. Validate and remove geometric leakage
-before using it to test whether communication is necessary. The sweep generator's
-private-goal default is experimental and has not passed that validation.
+for other robots. Use `--goal-spawn-mode independent` for private-goal experiments:
+it draws goal direction separately from spawn-ring rotation. The default `coupled`
+mode retains historical seeded scenarios and their geometric cue. The sweep generator
+defaults to all-goal observations and rejects private-goal sweeps in coupled mode.
+Removing this cue alone does not establish that communication is necessary; compare
+with no-communication controls before drawing that conclusion.
 
 `validate_task.py` compares a privileged scripted controller with random actions to
 check feasibility. Scripted success does not establish PPO learnability. The development
@@ -79,6 +90,19 @@ pilots in `pilot_runs` use repeated validation seeds, not an untouched test set.
 venv314/bin/python evaluate.py runs/attention_k2_s0/policy_00300.pt --episodes 50 --seed-start 100000 --output evaluation_s0.json
 venv314/bin/python analyze_attention_entropy.py runs/attention_k2_s0/policy_00300.pt --episodes 10 --output routing_s0.json
 ```
+
+For transport failures, record full development trajectories and compare the original
+episode horizon with extra time using the same deterministic policy:
+
+```bash
+venv314/bin/python diagnose_transport.py pilot_runs/dense_credit_s103_continued/policy_00081.pt --episodes 50 --seed-start 80000 --extended-steps 750 --output transport_diagnostic.json
+```
+
+This saves positions, headings, actions, contact counts, payload motion and tail
+statistics. The extended rollout's prefix reproduces the original horizon because
+`max_steps` affects truncation only. Extra-time success is a changed evaluation
+condition, not evidence that training improved. Velocity agreement uses post-step
+proximity weights and is descriptive, not an exact force decomposition.
 
 Validation seeds start at 50000. Reserve evaluation seeds (default 100000) for held-out
 comparisons after development choices are fixed. Actions use clipped Gaussian means;
@@ -116,6 +140,21 @@ venv314/bin/python run_sweep.py --root runs/sweep_v2 --backend kinematic --budge
 This prints commands. Add `--execute` to run them sequentially. Each condition uses the
 same training budget and seed list. Old shell launchers are disabled because they reused
 and truncated historical log paths. No long sweep is started automatically.
+
+To reproduce the robot-relative transport pilot and its no-communication control:
+
+```bash
+venv314/bin/python run_sweep.py --root runs/transport_replication --backend kinematic --seeds 104 105 --conditions dense no_comm --iterations 40 --num-robots 8 --workers 4 --goal-observers -1 --observation-frame robot --max-steps 250 --train-batch-size 512 --epochs 2 --gnn-num-layers 1 --eval-episodes 20 --development-episodes 50
+```
+
+The runner saves the complete schedule and source hashes, forwards the same training
+settings to every condition, rejects existing logs, and stops if task/model/training
+sources change mid-sweep. `--development-episodes` evaluates final exports on seeds
+starting at 80000 by default; it does not consume the reserved final-test set.
+
+The completed [transport replication](pilot_runs/robot_frame_replication_20260917/RESULTS.md)
+documents two matched dense/no-message seeds. It supports improved learnability but
+does not establish that the current all-goal task benefits from communication.
 
 After separately evaluating each trained policy on the same episode seeds:
 
