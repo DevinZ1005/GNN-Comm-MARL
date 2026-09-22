@@ -26,6 +26,36 @@ from ray.rllib.utils.typing import TensorType, ModelConfigDict
 from gnn_comm_layer import DynamicTopologicalGNN
 
 
+def robot_frame_features(local, nodes, edges):
+    """Express each actor's graph in its own XY position and heading frame.
+
+    Uses only the focal robot's pose to choose the frame. Masked goal vectors,
+    body-relative lidar, adjacency and random routing scores are preserved.
+    """
+    sine, cosine = local[:, 24], local[:, 25]
+
+    def rotate(vectors):
+        shape = (-1,) + (1,) * (vectors.dim() - 2)
+        s, c = sine.reshape(shape), cosine.reshape(shape)
+        x, y = vectors[..., 0], vectors[..., 1]
+        return torch.stack((c * x + s * y, -s * x + c * y), dim=-1)
+
+    def features(values):
+        result = values.clone()
+        result[..., :2] = rotate(values[..., :2] - local[:, None, :2])
+        for start in (3, 18, 21):
+            result[..., start:start + 2] = rotate(values[..., start:start + 2])
+        s, c = sine[:, None], cosine[:, None]
+        result[..., 24] = values[..., 24] * c - values[..., 25] * s
+        result[..., 25] = values[..., 25] * c + values[..., 24] * s
+        return result
+
+    framed_edges = edges.clone()
+    for start in (0, 3):
+        framed_edges[..., start:start + 2] = rotate(edges[..., start:start + 2])
+    return features(local[:, None, :]).squeeze(1), features(nodes), framed_edges
+
+
 class GNNMARLModel(TorchModelV2, nn.Module):
     """
     RLlib TorchModelV2 integrating local sensor processing with dynamic topological GNN communication.
@@ -64,7 +94,7 @@ class GNNMARLModel(TorchModelV2, nn.Module):
 
         # Extract hyperparameters from custom_model_config or kwargs with robust fallbacks
         custom_cfg = model_config.get("custom_model_config", {})
-        self.raw_obs_dim = kwargs.get("raw_obs_dim", custom_cfg.get("raw_obs_dim", 24))
+        self.raw_obs_dim = kwargs.get("raw_obs_dim", custom_cfg.get("raw_obs_dim", 27))
         self.edge_dim = kwargs.get("edge_dim", custom_cfg.get("edge_dim", 8))
         self.comm_latent_dim = kwargs.get("comm_latent_dim", custom_cfg.get("comm_latent_dim", 64))
         self.local_hidden_dim = kwargs.get("local_hidden_dim", custom_cfg.get("local_hidden_dim", 128))
@@ -74,6 +104,11 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         self.topk_mode = kwargs.get("topk_mode", custom_cfg.get("topk_mode", "attention"))
         self.gumbel_temperature = kwargs.get("gumbel_temperature", custom_cfg.get("gumbel_temperature", 1.0))
         self.no_comm = kwargs.get("no_comm", custom_cfg.get("no_comm", False))
+        self.observation_frame = custom_cfg.get("observation_frame", "world")
+        if self.observation_frame not in ("world", "robot"):
+            raise ValueError("observation_frame must be world or robot")
+        if self.observation_frame == "robot" and (self.raw_obs_dim != 27 or self.edge_dim != 8):
+            raise ValueError("robot observation frame requires the 27/8 feature schema")
 
         # If annealing is configured, start dense — the callback in train.py drives the ramp-down
         top_k_anneal_steps = kwargs.get("top_k_anneal_steps", custom_cfg.get("top_k_anneal_steps", None))
@@ -116,6 +151,10 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         # The actor uses only joint_dim = local + comm; the critic additionally sees
         # a mean-pooled global state across all node embeddings for CTDE.
         critic_dim = joint_dim + self.comm_latent_dim
+        # Identical centralized information in every routing ablation, including no-comm.
+        self.global_encoder = nn.Sequential(
+            nn.Linear(self.raw_obs_dim, self.comm_latent_dim), nn.ReLU()
+        )
         self.critic_head = nn.Sequential(
             nn.Linear(critic_dim, self.local_hidden_dim),
             nn.ReLU(),
@@ -152,6 +191,9 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         adj_matrix = obs_dict["adj_matrix"].float()
         edge_features = obs_dict["edge_features"].float()
         random_comm_mask = obs_dict["random_comm_mask"].float()
+        if self.observation_frame == "robot":
+            local_obs, node_features, edge_features = robot_frame_features(
+                local_obs, node_features, edge_features)
         
         # node_index indicates which node in the graph corresponds to the evaluating agent
         node_index = obs_dict["node_index"].long()
@@ -204,7 +246,7 @@ class GNNMARLModel(TorchModelV2, nn.Module):
         # 6. CTDE Critic: additionally sees global state via mean-pooling across all nodes.
         # This gives the value function access to the full team's latent state during
         # centralized training, while the actor remains strictly decentralized.
-        global_state = gnn_latents.mean(dim=1)  # (batch_size, comm_latent_dim)
+        global_state = self.global_encoder(node_features).mean(dim=1)
         critic_input = torch.cat([joint_features, global_state], dim=-1)  # (batch_size, critic_dim)
         self._cur_value = self.critic_head(critic_input).squeeze(-1)
 
@@ -290,4 +332,3 @@ if __name__ == "__main__":
     assert model.gnn_layer.top_k == 2, f"Expected gnn_layer.top_k to be 2, got {model.gnn_layer.top_k}"
     print(f"Logits shape: {logits.shape} | Values shape: {values.shape} | Average Drop Frac: {drop_frac:.4f}")
     print("Verification passed! GNNMARLModel integrates correctly with RLlib TorchModelV2 API and top-K sparsification.")
-
